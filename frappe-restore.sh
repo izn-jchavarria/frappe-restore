@@ -4,7 +4,7 @@
 #  Gestor de restauraciones para Frappe / ERPNext
 #  Origenes soportados: Unidad de Red (CIFS) y Google Drive (rclone)
 #  Restaura los respaldos producidos por iZone ENTERPRISE - BACKUPS
-#  Version: 1.0.0
+#  Version: 2.0.0
 #
 #  Uso:  sudo ./frappe-restore.sh
 # =====================================================================
@@ -130,15 +130,6 @@ si_no_nav() {
   done
 }
 
-# Confirmacion fuerte: hay que escribir exactamente el texto indicado.
-confirmar_escribiendo() {
-  local esperado="$1" leido=""
-  say "  ${C_DIM}Para confirmar escriba exactamente: ${C_R}${C_B}${esperado}${C_R}"
-  read -rp "  Confirmacion: " leido || fin_entrada
-  leido="$(printf '%s' "$leido" | sed -e 's/^[[:space:]]*//' -e 's/[[:space:]]*$//')"
-  [ "$leido" = "$esperado" ]
-}
-
 aviso_navegacion() {
   say "  ${C_DIM}En cualquier pregunta: ${C_B}v${C_R}${C_DIM} = volver al paso anterior · ${C_B}x${C_R}${C_DIM} = cancelar${C_R}"
   echo
@@ -262,9 +253,9 @@ cargar_conf() {
   unset JOB_TIPO JOB_NOMBRE ETIQUETA ORIGEN_CONF MONTAJE_PROPIO \
         SERVIDOR SMB_PORT RECURSO SUBCARPETA UNC MOUNT_POINT CRED_FILE SMB_VERS MOUNT_OPTS \
         RCLONE_REMOTE DEST_PATH RCLONE_CONFIG \
-        BENCH_PATH BENCH_USER SITE DB_CRED_FILE DB_FLAG TEMP_LOCAL \
+        BENCH_PATH BENCH_USER SITE DB_CRED_FILE DB_USER DB_FLAG DB_USER_FLAG TEMP_LOCAL \
         PREVIO PREVIO_DIR PREVIO_CONSERVAR \
-        MIGRAR SCHEDULER MUTE_EMAILS \
+        MIGRAR SCHEDULER MUTE_EMAILS EXCLUIR_APPS \
         AUTOMATICO HORARIOS DIAS_CRON \
         LOG_FILE RCLONE_LOG STATE_FILE 2>/dev/null
   # shellcheck disable=SC1090
@@ -757,6 +748,7 @@ menu_cuentas_drive() {
   done
 }
 
+
 # ====================== FRAPPE: SITIO DESTINO =========================
 # bench se niega a correr como root en varias versiones, y el propietario del
 # bench es quien debe ejecutarlo. Aqui se ejecuta siempre como ese usuario.
@@ -773,9 +765,6 @@ run_bench() {
 
 pedir_frappe_destino() {
   local encontrados=() sitios=() n i opcion duenio
-  echo
-  say "  ${C_B}Sitio que se va a sobrescribir${C_R}"
-  say "  ${C_DIM}Este es el sitio que quedara reemplazado por el contenido del respaldo.${C_R}"
   echo
   mapfile -t encontrados < <(ls -d /home/*/frappe-bench 2>/dev/null)
   n="${#encontrados[@]}"
@@ -799,7 +788,7 @@ pedir_frappe_destino() {
 
   duenio="$(stat -c '%U' "$BENCH_PATH" 2>/dev/null)"
   echo
-  say "  ${C_DIM}bench debe ejecutarse con el usuario propietario del bench, no con root.${C_R}"
+  say "  ${C_DIM}bench se ejecuta con el usuario propietario del bench, no con root.${C_R}"
   pedir BENCH_USER "Usuario que ejecuta bench" "${BENCH_USER:-${duenio:-frappe}}" || return $?
   if ! id "$BENCH_USER" >/dev/null 2>&1; then
     err "El usuario '${BENCH_USER}' no existe en este servidor."
@@ -827,33 +816,30 @@ pedir_frappe_destino() {
   return 0
 }
 
-# Avisa si el sitio destino es el mismo que algun trabajo de respaldo de este
-# servidor respalda: seria restaurar produccion sobre si misma.
-alerta_mismo_sitio() {
-  local c s encontrado=""
-  for c in $(listar_confs_respaldo); do
-    s="$( . "$c" >/dev/null 2>&1; printf '%s' "${SITE:-}" )"
-    [ "$s" = "$1" ] && encontrado="$( . "$c" >/dev/null 2>&1; printf '%s' "${ETIQUETA:-}" )"
-  done
-  [ -n "$encontrado" ] && printf '%s' "$encontrado"
-  [ -n "$encontrado" ]
-}
-
-detectar_flag_db() {
+# El nombre de estas opciones cambio entre versiones de bench. Se consulta una
+# vez al crear el trabajo y se guarda en el .conf.
+detectar_flags_db() {
   local salida
   salida="$(run_bench --site "$SITE" restore --help 2>&1)"
   if printf '%s' "$salida" | grep -q -- "--db-root-password"; then
-    printf '%s' "--db-root-password"
+    DB_FLAG="--db-root-password"
   elif printf '%s' "$salida" | grep -q -- "--mariadb-root-password"; then
-    printf '%s' "--mariadb-root-password"
+    DB_FLAG="--mariadb-root-password"
   else
-    printf '%s' ""
+    DB_FLAG="--db-root-password"
+  fi
+  if printf '%s' "$salida" | grep -q -- "--db-root-username"; then
+    DB_USER_FLAG="--db-root-username"
+  elif printf '%s' "$salida" | grep -q -- "--mariadb-root-username"; then
+    DB_USER_FLAG="--mariadb-root-username"
+  else
+    DB_USER_FLAG=""
   fi
 }
 
-probar_password_db() {   # $1 = contrasena
+probar_password_db() {   # $1 = usuario  $2 = contrasena
   command -v mysql >/dev/null 2>&1 || return 2
-  MYSQL_PWD="$1" mysql --user=root --execute="SELECT 1" >/dev/null 2>&1
+  MYSQL_PWD="$2" mysql --user="$1" --execute="SELECT 1" >/dev/null 2>&1
 }
 
 # ===================== LISTADO DE RESPALDOS ==========================
@@ -875,6 +861,16 @@ asegurar_montaje() {
   mountpoint -q "$1" && return 0
   mount "$1" >/dev/null 2>&1
   mountpoint -q "$1"
+}
+
+nombre_mes() {
+  case "$1" in
+    01) echo "enero";;   02) echo "febrero";;  03) echo "marzo";;
+    04) echo "abril";;   05) echo "mayo";;     06) echo "junio";;
+    07) echo "julio";;   08) echo "agosto";;   09) echo "septiembre";;
+    10) echo "octubre";; 11) echo "noviembre";; 12) echo "diciembre";;
+    *) echo "mes $1";;
+  esac
 }
 
 # Muestra los respaldos disponibles. Devuelve 1 si no hay ninguno.
@@ -931,6 +927,8 @@ while [ $# -gt 0 ]; do
   shift
 done
 
+INICIO_SEG="$(date +%s)"
+
 # --------------------------- utilidades ------------------------------
 run_bench() {
   local a q="" linea
@@ -941,6 +939,40 @@ run_bench() {
   else
     su -l "$BENCH_USER" -c "$linea"
   fi
+}
+
+# SQL directo contra la base del sitio, sin pasar por bench: se necesita
+# cuando una app declarada en el respaldo no existe en este servidor y
+# cualquier orden de bench falla al cargar sus hooks.
+sql_sitio() {
+  local cfg="${BENCH_PATH}/sites/${SITE}/site_config.json" dbn dbp dbh
+  [ -r "$cfg" ] || return 1
+  command -v mysql >/dev/null 2>&1 || return 1
+  dbn="$(sed -n 's/.*"db_name"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$cfg" | head -n 1)"
+  dbp="$(sed -n 's/.*"db_password"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$cfg" | head -n 1)"
+  dbh="$(sed -n 's/.*"db_host"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$cfg" | head -n 1)"
+  [ -n "$dbn" ] || return 1
+  if [ -n "$dbh" ]; then
+    MYSQL_PWD="$dbp" mysql --user="$dbn" --host="$dbh" --database="$dbn"
+  else
+    MYSQL_PWD="$dbp" mysql --user="$dbn" --database="$dbn"
+  fi
+}
+
+# Quita del sitio restaurado las apps que este servidor no tiene. Se ejecuta
+# despues de restaurar y antes de migrar, porque si no 'bench migrate' falla
+# con "No module named" y no hay forma de desinstalarlas con bench.
+quitar_apps_excluidas() {
+  [ -n "${EXCLUIR_APPS:-}" ] || return 0
+  local app
+  for app in $EXCLUIR_APPS; do
+    if printf "SET SQL_SAFE_UPDATES=0;\nUPDATE \`tabDefaultValue\` SET defvalue=REPLACE(REPLACE(REPLACE(defvalue,'\"%s\", ',''),', \"%s\"',''),'\"%s\"','') WHERE defkey='installed_apps';\nDELETE FROM \`tabInstalled Application\` WHERE app_name='%s';\n" \
+         "$app" "$app" "$app" "$app" | sql_sitio >/dev/null 2>&1; then
+      log "[OK] App '${app}' retirada del sitio restaurado."
+    else
+      log "[AVISO] No se pudo retirar la app '${app}'. Revise que exista el cliente mysql."
+    fi
+  done
 }
 
 montar_origen() {
@@ -988,12 +1020,22 @@ montar_origen || fallo "No se pudo acceder al origen de los respaldos."
 if [ "$MODO" = "ruta" ]; then
   [ -n "$RUTA_PEDIDA" ] || fallo "No se indico la ruta del respaldo."
   RUTA="$RUTA_PEDIDA"
+  FECHA_RESPALDO="$(listar | awk -F'|' -v r="$RUTA" '$2==r {print $1; exit}')"
 else
   LINEA="$(listar | head -n 1)"
   [ -n "$LINEA" ] || fallo "No se encontro ningun respaldo en el origen."
   RUTA="${LINEA#*|}"
+  FECHA_RESPALDO="${LINEA%%|*}"
 fi
-log "[INFO] Respaldo seleccionado: ${RUTA}"
+log "[INFO] Respaldo seleccionado: ${RUTA}${FECHA_RESPALDO:+  (${FECHA_RESPALDO})}"
+
+if [ -n "${FECHA_RESPALDO:-}" ]; then
+  SEG_RESPALDO="$(date -d "$FECHA_RESPALDO" +%s 2>/dev/null)"
+  if [ -n "$SEG_RESPALDO" ]; then
+    DESFASE=$(( (INICIO_SEG - SEG_RESPALDO) / 60 ))
+    log "[INFO] El respaldo tiene ${DESFASE} minutos de antiguedad."
+  fi
+fi
 
 if [ "$MODO" = "ultimo" ] && [ "$FORZAR" != "1" ] && [ -f "${STATE_FILE:-/dev/null}" ]; then
   if [ "$(cat "$STATE_FILE" 2>/dev/null)" = "$RUTA" ]; then
@@ -1052,7 +1094,7 @@ if [ "$SIMULAR" = "1" ]; then
   log "[INFO] Simulacion: el respaldo es valido y se pudo traer completo."
   log "[INFO] No se toco el sitio ${SITE}."
   limpiar
-  log "[FIN] Simulacion terminada."
+  log "[FIN] Simulacion terminada en $(( $(date +%s) - INICIO_SEG )) segundos."
   exit 0
 fi
 
@@ -1060,7 +1102,7 @@ fi
 SITIO_EXISTE=0
 [ -d "${BENCH_PATH}/sites/${SITE}" ] && SITIO_EXISTE=1
 
-if [ "${PREVIO:-si}" = "si" ] && [ "$SITIO_EXISTE" = "1" ]; then
+if [ "${PREVIO:-no}" = "si" ] && [ "$SITIO_EXISTE" = "1" ]; then
   DEST_PREVIO="${PREVIO_DIR}/$(date +%Y%m%d-%H%M%S)"
   ORIGEN_BK="${BENCH_PATH}/sites/${SITE}/private/backups"
   MARCA="$(mktemp)"
@@ -1071,8 +1113,7 @@ if [ "${PREVIO:-si}" = "si" ] && [ "$SITIO_EXISTE" = "1" ]; then
     if [ -n "$(ls -A "$DEST_PREVIO" 2>/dev/null)" ]; then
       log "[OK] Respaldo de seguridad en ${DEST_PREVIO}"
     else
-      rm -rf "$DEST_PREVIO"
-      rm -f "$MARCA"
+      rm -rf "$DEST_PREVIO"; rm -f "$MARCA"
       fallo "El respaldo de seguridad no genero archivos. No se toca el sitio."
     fi
   else
@@ -1084,8 +1125,6 @@ if [ "${PREVIO:-si}" = "si" ] && [ "$SITIO_EXISTE" = "1" ]; then
     ls -1dt "${PREVIO_DIR}"/*/ 2>/dev/null | tail -n +$((PREVIO_CONSERVAR + 1)) \
       | while read -r viejo; do rm -rf "$viejo"; done
   fi
-elif [ "${PREVIO:-si}" = "si" ]; then
-  log "[AVISO] El sitio ${SITE} aun no existe; no hay nada que respaldar antes."
 fi
 
 # --------------------------- restaurar -------------------------------
@@ -1095,14 +1134,15 @@ SALIDA_FINAL=0
 ARGS=(--site "$SITE" restore "$SQL" --force)
 [ -n "$PUB" ]  && ARGS+=(--with-public-files "$PUB")
 [ -n "$PRIV" ] && ARGS+=(--with-private-files "$PRIV")
+[ -n "${DB_USER_FLAG:-}" ] && ARGS+=("$DB_USER_FLAG" "${DB_USER:-root}")
 [ -n "${DB_FLAG:-}" ] && [ -n "${DB_ROOT_PASS:-}" ] && ARGS+=("$DB_FLAG" "$DB_ROOT_PASS")
 
 log "[INFO] Restaurando sobre ${SITE}. El sitio queda en mantenimiento mientras dure."
 if run_bench "${ARGS[@]}"; then
-  log "[OK] Base de datos y adjuntos restaurados desde ${RUTA}"
+  log "[OK] Restaurado desde ${RUTA}"
 else
   log "[ERROR] 'bench restore' fallo. El sitio puede haber quedado a medias."
-  [ "${PREVIO:-si}" = "si" ] && [ -n "${DEST_PREVIO:-}" ] \
+  [ "${PREVIO:-no}" = "si" ] && [ -n "${DEST_PREVIO:-}" ] \
     && log "[ERROR] Para volver atras use el respaldo de seguridad: ${DEST_PREVIO}"
   run_bench --site "$SITE" set-maintenance-mode off >/dev/null 2>&1
   limpiar
@@ -1110,13 +1150,16 @@ else
 fi
 
 # --------------------- ajustes posteriores ---------------------------
+quitar_apps_excluidas
+
 if [ "${MIGRAR:-si}" = "si" ]; then
   log "[INFO] Aplicando migraciones (bench migrate)..."
   if run_bench --site "$SITE" migrate; then
     log "[OK] Migraciones aplicadas."
   else
-    log "[AVISO] 'bench migrate' fallo. Revise que las apps del servidor coincidan"
-    log "[AVISO] con las del servidor de origen y ejecutelo a mano."
+    log "[AVISO] 'bench migrate' fallo. Suele ser porque el respaldo declara apps"
+    log "[AVISO] que este servidor no tiene. Agreguelas al bench, o indiquelas en"
+    log "[AVISO] 'Apps a excluir' dentro de las opciones del trabajo."
     SALIDA_FINAL=5
   fi
 fi
@@ -1152,7 +1195,7 @@ log "[OK] Sitio fuera de mantenimiento."
 printf '%s\n' "$RUTA" > "${STATE_FILE:-/dev/null}" 2>/dev/null
 chmod 640 "${STATE_FILE:-/dev/null}" 2>/dev/null
 limpiar
-log "[FIN] Restauracion de '${ETIQUETA}' terminada (codigo ${SALIDA_FINAL})."
+log "[FIN] Restauracion de '${ETIQUETA}' terminada en $(( $(date +%s) - INICIO_SEG )) segundos (codigo ${SALIDA_FINAL})."
 exit "$SALIDA_FINAL"
 EOF
   chmod 750 "$2"
@@ -1163,6 +1206,8 @@ EOF
 #   0 = continuar   2 = volver al paso anterior   3 = cancelar   4 = corregir
 #   9 = creado
 # En cualquier pregunta se puede escribir 'v' para volver o 'x' para cancelar.
+# Lo que no se pregunta aqui tiene un valor por defecto y se ajusta despues
+# desde 'Opciones' dentro del trabajo.
 
 crear_trabajo() {
   local TIPO="$1"
@@ -1171,9 +1216,10 @@ crear_trabajo() {
   local SRV="" SMB_PORT="445" CIFS_USER="" CIFS_PASS="" CIFS_DOM="" SHARE="" SUB="" UNC=""
   local SMB_VERS="" MOUNT_POINT="" MOUNT_OPTS=""
   local RCLONE_REMOTE="" DEST_PATH=""
-  local BENCH_PATH="" BENCH_USER="" SITE="" DB_FLAG="" DB_ROOT_PASS="" ADMIN_PASS="" TEMP_LOCAL=""
-  local PREVIO="si" PREVIO_DIR="" PREVIO_CONSERVAR="3"
-  local MIGRAR="si" SCHEDULER="no-tocar" MUTE_EMAILS="no"
+  local BENCH_PATH="" BENCH_USER="" SITE="" TEMP_LOCAL=""
+  local DB_USER="root" DB_ROOT_PASS="" DB_FLAG="" DB_USER_FLAG="" ADMIN_PASS=""
+  local PREVIO="no" PREVIO_DIR="" PREVIO_CONSERVAR="3"
+  local MIGRAR="si" SCHEDULER="no-tocar" MUTE_EMAILS="no" EXCLUIR_APPS=""
   local AUTOMATICO="no" HORARIOS="" DIAS_CRON="*"
   local paso=1 estado NAV_ON=1 volver_resumen=0
 
@@ -1181,18 +1227,14 @@ crear_trabajo() {
     case "$paso" in
       1) rst_paso_etiqueta;;
       2) rst_paso_origen;;
-      3) rst_paso_verificar;;
-      4) rst_paso_destino;;
-      5) rst_paso_basedatos;;
-      6) rst_paso_previo;;
-      7) rst_paso_posterior;;
-      8) rst_paso_programacion;;
-      9) rst_paso_resumen;;
+      3) rst_paso_destino;;
+      4) rst_paso_programacion;;
+      5) rst_paso_resumen;;
       *) break;;
     esac
     estado=$?
     case "$estado" in
-      0) if [ "$volver_resumen" = "1" ]; then paso=9; volver_resumen=0
+      0) if [ "$volver_resumen" = "1" ]; then paso=5; volver_resumen=0
          else paso=$((paso+1)); fi;;
       2) volver_resumen=0; paso=$((paso-1))
          [ "$paso" -lt 1 ] && { rst_cancelar; return 0; };;
@@ -1216,7 +1258,7 @@ rst_cancelar() {
 rst_paso_etiqueta() {
   local titulo="Unidad de Red (CIFS)"
   [ "$TIPO" = "drive" ] && titulo="Google Drive"
-  pantalla "NUEVO TRABAJO  >  ${titulo}   [1 de 9]"
+  pantalla "NUEVO TRABAJO  >  ${titulo}   [1 de 5]"
   if [ "$TIPO" = "red" ]; then
     if ! command -v mount.cifs >/dev/null 2>&1; then
       info "Verificando dependencias..."
@@ -1229,12 +1271,12 @@ rst_paso_etiqueta() {
     command -v rclone >/dev/null 2>&1 || { asegurar_paquete rclone rclone || { enter; return 3; }; echo; }
   fi
   aviso_navegacion
-  say "  ${C_DIM}Un trabajo de restauracion es un origen de respaldos mas un sitio${C_R}"
-  say "  ${C_DIM}destino. Puede ejecutarse a mano o quedar programado.${C_R}"
+  say "  ${C_DIM}Un trabajo es un origen de respaldos mas un sitio destino. Se ejecuta${C_R}"
+  say "  ${C_DIM}a mano desde el menu, y opcionalmente queda programado.${C_R}"
   echo
   pedir_etiqueta || return $?
-  CONF="${APP_DIR}/${JOB}.conf";       SCRIPT="${BIN_DIR}/${JOB}.sh"
-  LOG_FILE="${LOG_DIR}/${JOB}.log";    RCLONE_LOG="${LOG_DIR}/${JOB}-rclone.log"
+  CONF="${APP_DIR}/${JOB}.conf";        SCRIPT="${BIN_DIR}/${JOB}.sh"
+  LOG_FILE="${LOG_DIR}/${JOB}.log";     RCLONE_LOG="${LOG_DIR}/${JOB}-rclone.log"
   STATE_FILE="${APP_DIR}/${JOB}.state"; DB_CRED_FILE="${APP_DIR}/${JOB}.dbcred"
   PREVIO_DIR="${PREVIO_BASE}/${JOB}"
   TEMP_LOCAL="/var/tmp/${JOB}"
@@ -1243,7 +1285,56 @@ rst_paso_etiqueta() {
 
 # ---------------------------- [2] Origen -----------------------------
 rst_paso_origen() {
+  local r
   if [ "$TIPO" = "red" ]; then rst_origen_red; else rst_origen_drive; fi
+  r=$?
+  [ "$r" -ne 0 ] && return "$r"
+  verificar_origen
+}
+
+# Tras elegir el origen se listan los respaldos que se ven ahi. Es la
+# comprobacion que detecta una carpeta mal elegida antes de seguir.
+verificar_origen() {
+  local r
+  pantalla "TRABAJO '${ETIQUETA}'  >  [2 de 5] Respaldos encontrados"
+  if [ "$TIPO" = "red" ]; then
+    say "  Origen: ${C_B}${UNC}${C_R}  en ${MOUNT_POINT}"
+    echo
+    if ! asegurar_montaje "$MOUNT_POINT"; then
+      err "El recurso no esta montado en ${MOUNT_POINT}."
+      echo
+      si_no_nav "Continuar de todos modos?"; r=$?
+      case "$r" in 0) return 0;; 1) return 2;; *) return "$r";; esac
+    fi
+    info "Leyendo el contenido de ${MOUNT_POINT}..."
+    echo
+    if mostrar_respaldos red "$MOUNT_POINT" "" 8; then
+      echo; ok "Se encontraron respaldos con la estructura <fecha>/<hora>."
+    else
+      err "No se encontraron carpetas con la estructura <fecha>/<hora>."
+      say "    ${C_DIM}El origen debe apuntar a la carpeta que contiene las fechas, no${C_R}"
+      say "    ${C_DIM}a una fecha concreta. Con 'v' vuelve a corregirlo.${C_R}"
+      echo
+      si_no_nav "Continuar de todos modos?"; r=$?
+      case "$r" in 0) ;; 1) return 2;; *) return "$r";; esac
+    fi
+  else
+    say "  Origen: ${C_B}${RCLONE_REMOTE}:${DEST_PATH}${C_R}"
+    echo
+    info "Leyendo el contenido del Drive..."
+    echo
+    if mostrar_respaldos drive "$RCLONE_REMOTE" "$DEST_PATH" 8; then
+      echo; ok "Se encontraron respaldos con la estructura <fecha>/<hora>."
+    else
+      err "No se encontraron carpetas con la estructura <fecha>/<hora>."
+      say "    ${C_DIM}El origen debe apuntar a la carpeta que contiene las fechas.${C_R}"
+      echo
+      si_no_nav "Continuar de todos modos?"; r=$?
+      case "$r" in 0) ;; 1) return 2;; *) return "$r";; esac
+    fi
+  fi
+  enter
+  return 0
 }
 
 heredar_red() {   # $1 = .conf del gestor de respaldos
@@ -1268,7 +1359,7 @@ heredar_drive() {
 
 rst_origen_red() {
   local confs=() i op res
-  pantalla "TRABAJO '${ETIQUETA}'  >  [2 de 9] Origen de los respaldos"
+  pantalla "TRABAJO '${ETIQUETA}'  >  [2 de 5] Origen de los respaldos"
   aviso_navegacion
   mapfile -t confs < <(listar_confs_respaldo red)
   if [ "${#confs[@]}" -gt 0 ]; then
@@ -1289,15 +1380,14 @@ rst_origen_red() {
       if [[ "$op" =~ ^[0-9]+$ ]] && [ "$op" -ge 1 ] && [ "$op" -le "${#confs[@]}" ]; then
         heredar_red "${confs[$((op-1))]}"
         echo; ok "Origen: ${UNC}"
-        say "    ${C_DIM}montaje  : ${MOUNT_POINT}${C_R}"
-        say "    ${C_DIM}heredado de: $(basename "$ORIGEN_CONF")${C_R}"
+        say "    ${C_DIM}montaje: ${MOUNT_POINT}   heredado de $(basename "$ORIGEN_CONF")${C_R}"
         sleep 2; return 0
       elif [ "$op" = "0" ]; then break
       else err "Opcion invalida."; fi
     done
   else
-    say "  ${C_DIM}No se encontraron trabajos de respaldo hacia unidades de red en este${C_R}"
-    say "  ${C_DIM}servidor, asi que el origen se configura aqui desde cero.${C_R}"
+    say "  ${C_DIM}No hay trabajos de respaldo hacia unidades de red en este servidor,${C_R}"
+    say "  ${C_DIM}asi que el origen se configura aqui desde cero.${C_R}"
     echo; enter
   fi
   MONTAJE_PROPIO="si"
@@ -1331,7 +1421,7 @@ orn_servidor() {
   local op preguntar=1
   while true; do
     if [ "$preguntar" = "1" ]; then
-      pantalla "TRABAJO '${ETIQUETA}'  >  [2 de 9] Servidor de archivos"
+      pantalla "TRABAJO '${ETIQUETA}'  >  [2 de 5] Servidor de archivos"
       aviso_navegacion
       say "  ${C_DIM}Direccion del NAS o servidor donde estan los respaldos.${C_R}"
       pedir SRV "Direccion IP o nombre del servidor" "$SRV" || return $?
@@ -1348,8 +1438,6 @@ orn_servidor() {
       say "    ${C_DIM}- la IP no corresponde a ese NAS${C_R}"
       say "    ${C_DIM}- el servicio SMB esta desactivado en el NAS${C_R}"
       say "    ${C_DIM}- el servidor y el NAS estan en redes distintas, o hay un firewall${C_R}"
-      say "    ${C_DIM}Que el NAS abra su interfaz web (5001 en Synology) no implica que${C_R}"
-      say "    ${C_DIM}el 445 este disponible: son servicios distintos.${C_R}"
     fi
     echo
     say "   1) Corregir la direccion"
@@ -1374,10 +1462,10 @@ orn_servidor() {
 }
 
 orn_credenciales() {
-  pantalla "TRABAJO '${ETIQUETA}'  >  [2 de 9] Credenciales del recurso"
+  pantalla "TRABAJO '${ETIQUETA}'  >  [2 de 5] Credenciales del recurso"
   aviso_navegacion
-  say "  ${C_DIM}Usuario creado EN ESE SERVIDOR. Para restaurar basta permiso de${C_R}"
-  say "  ${C_DIM}lectura: el recurso se montara en solo lectura.${C_R}"
+  say "  ${C_DIM}Usuario creado EN ESE SERVIDOR. Basta permiso de lectura: el recurso${C_R}"
+  say "  ${C_DIM}se monta en solo lectura.${C_R}"
   pedir CIFS_USER "Usuario" "$CIFS_USER" || return $?
   say "  ${C_DIM}No se muestra mientras escribe. Sin comillas.${C_R}"
   pedir_secreto CIFS_PASS "Contrasena" || return $?
@@ -1393,7 +1481,7 @@ orn_credenciales() {
 
 orn_recurso() {
   local recursos=() i opcion
-  pantalla "TRABAJO '${ETIQUETA}'  >  [2 de 9] Carpeta compartida"
+  pantalla "TRABAJO '${ETIQUETA}'  >  [2 de 5] Carpeta compartida"
   aviso_navegacion
   command -v smbclient >/dev/null 2>&1 || asegurar_paquete smbclient smbclient
   if command -v smbclient >/dev/null 2>&1; then
@@ -1418,7 +1506,6 @@ orn_recurso() {
     done
   else
     warn "No se pudo obtener la lista de carpetas compartidas."
-    say "  ${C_DIM}Revise las credenciales, o escriba el nombre del recurso a mano.${C_R}"
     say "  ${C_DIM}Solo el nombre del recurso, sin // ni la IP.${C_R}"
     pedir SHARE "Nombre exacto de la carpeta compartida" "$SHARE" || return $?
     normalizar_recurso; return 0
@@ -1443,12 +1530,11 @@ normalizar_recurso() {
 
 orn_subcarpeta() {
   local subs=() i opcion r
-  pantalla "TRABAJO '${ETIQUETA}'  >  [2 de 9] Subcarpeta"
+  pantalla "TRABAJO '${ETIQUETA}'  >  [2 de 5] Subcarpeta"
   aviso_navegacion
   say "  Recurso elegido: ${C_B}//${SRV}/${SHARE}${C_R}"
   echo
-  say "  ${C_DIM}Debe apuntar a la carpeta que contiene las carpetas de fecha,${C_R}"
-  say "  ${C_DIM}no a una fecha concreta.${C_R}"
+  say "  ${C_DIM}Debe apuntar a la carpeta que contiene las carpetas de fecha.${C_R}"
   echo
   if [ -n "$SUB" ]; then
     say "  Subcarpeta ya indicada: ${C_B}${SUB}${C_R}"
@@ -1493,7 +1579,7 @@ orn_subcarpeta() {
 
 orn_montaje() {
   local d salida r
-  pantalla "TRABAJO '${ETIQUETA}'  >  [2 de 9] Prueba de conexion"
+  pantalla "TRABAJO '${ETIQUETA}'  >  [2 de 5] Prueba de conexion"
   aviso_navegacion
   say "  Recurso: ${C_B}${UNC}${C_R}"
   echo
@@ -1507,7 +1593,6 @@ orn_montaje() {
     salida="$(mount -t cifs "$UNC" "$d" -o "ro,credentials=${CRED_FILE},vers=3.0,sec=ntlmssp,iocharset=utf8,nounix,noserverino$([ "$SMB_PORT" != "445" ] && echo ",port=${SMB_PORT}")" 2>&1)"
     rmdir "$d" 2>/dev/null
     echo; explicar_error_mount "$salida"; echo
-    say "  ${C_DIM}Con 'v' vuelve atras para corregir la ruta o las credenciales.${C_R}"
     si_no_nav "Guardar la configuracion de todas formas?"; r=$?
     case "$r" in
       1) return 2;;
@@ -1527,7 +1612,6 @@ orn_montaje() {
   salida="$(mount "$MOUNT_POINT" 2>&1)"
   if mountpoint -q "$MOUNT_POINT"; then
     ok "Recurso montado en ${MOUNT_POINT} (solo lectura)."
-    say "    ${C_DIM}Montado asi, este servidor no puede alterar ni borrar los respaldos.${C_R}"
   else
     explicar_error_mount "$salida"
     warn "Se guardo la configuracion; corrijala desde el trabajo."
@@ -1538,7 +1622,7 @@ orn_montaje() {
 
 rst_origen_drive() {
   local confs=() i op res arr=() opcion
-  pantalla "TRABAJO '${ETIQUETA}'  >  [2 de 9] Origen de los respaldos"
+  pantalla "TRABAJO '${ETIQUETA}'  >  [2 de 5] Origen de los respaldos"
   aviso_navegacion
   mapfile -t confs < <(listar_confs_respaldo drive)
   if [ "${#confs[@]}" -gt 0 ]; then
@@ -1564,9 +1648,8 @@ rst_origen_drive() {
   ORIGEN_CONF=""
   mapfile -t arr <<< "$(rclone listremotes 2>/dev/null | sed 's/:$//')"
   if [ -z "${arr[0]:-}" ]; then
-    pantalla "TRABAJO '${ETIQUETA}'  >  [2 de 9] Cuenta de Google Drive"
+    pantalla "TRABAJO '${ETIQUETA}'  >  [2 de 5] Cuenta de Google Drive"
     warn "No hay ninguna cuenta de Google Drive conectada en este servidor."
-    say "  ${C_DIM}Se necesita una cuenta con acceso de lectura a la carpeta de respaldos.${C_R}"
     echo
     si_no_nav "Conectar una cuenta ahora?"; local r=$?
     case "$r" in 2|3) return "$r";; 1) return 2;; esac
@@ -1574,7 +1657,7 @@ rst_origen_drive() {
     mapfile -t arr <<< "$(rclone listremotes 2>/dev/null | sed 's/:$//')"
     [ -z "${arr[0]:-}" ] && { err "Sigue sin haber cuentas."; enter; return 2; }
   fi
-  pantalla "TRABAJO '${ETIQUETA}'  >  [2 de 9] Cuenta de Google Drive"
+  pantalla "TRABAJO '${ETIQUETA}'  >  [2 de 5] Cuenta de Google Drive"
   aviso_navegacion
   if [ "${#arr[@]}" -eq 1 ]; then
     RCLONE_REMOTE="${arr[0]}"
@@ -1603,211 +1686,60 @@ rst_origen_drive() {
   return 0
 }
 
-# --------------- [3] Verificar que haya respaldos --------------------
-rst_paso_verificar() {
-  local r
-  pantalla "TRABAJO '${ETIQUETA}'  >  [3 de 9] Respaldos encontrados"
-  aviso_navegacion
-  if [ "$TIPO" = "red" ]; then
-    say "  Origen: ${C_B}${UNC}${C_R}  en ${MOUNT_POINT}"
-    echo
-    if ! asegurar_montaje "$MOUNT_POINT"; then
-      err "El recurso no esta montado en ${MOUNT_POINT}."
-      say "    ${C_DIM}Sin montaje no se puede leer ningun respaldo.${C_R}"
-      echo
-      si_no_nav "Continuar de todos modos?"; r=$?
-      case "$r" in 0) return 0;; 1) return 2;; *) return "$r";; esac
-    fi
-    info "Leyendo el contenido de ${MOUNT_POINT}..."
-    echo
-    if mostrar_respaldos red "$MOUNT_POINT" "" 8; then
-      echo; ok "Se encontraron respaldos con la estructura <fecha>/<hora>."
-      say "    ${C_DIM}Se ordenan por fecha real de la carpeta, no por su nombre.${C_R}"
-    else
-      err "No se encontraron carpetas con la estructura <fecha>/<hora>."
-      say "    ${C_DIM}Revise que la subcarpeta apunte a la raiz de los respaldos y no${C_R}"
-      say "    ${C_DIM}a una fecha concreta. Con 'v' vuelve a corregir el origen.${C_R}"
-      echo
-      si_no_nav "Continuar de todos modos?"; r=$?
-      case "$r" in 0) ;; 1) return 2;; *) return "$r";; esac
-    fi
-  else
-    say "  Origen: ${C_B}${RCLONE_REMOTE}:${DEST_PATH}${C_R}"
-    echo
-    info "Leyendo el contenido del Drive..."
-    echo
-    if mostrar_respaldos drive "$RCLONE_REMOTE" "$DEST_PATH" 8; then
-      echo; ok "Se encontraron respaldos con la estructura <fecha>/<hora>."
-    else
-      err "No se encontraron carpetas con la estructura <fecha>/<hora>."
-      say "    ${C_DIM}Revise la carpeta elegida. Con 'v' vuelve a corregir el origen.${C_R}"
-      echo
-      si_no_nav "Continuar de todos modos?"; r=$?
-      case "$r" in 0) ;; 1) return 2;; *) return "$r";; esac
-    fi
-  fi
-  echo
-  enter
-  return 0
-}
-
-# ----------------------- [4] Sitio destino ---------------------------
+# ----------------------- [3] Sitio destino ---------------------------
 rst_paso_destino() {
-  local etiqueta_bk
-  pantalla "TRABAJO '${ETIQUETA}'  >  [4 de 9] Sitio destino"
+  local r
+  pantalla "TRABAJO '${ETIQUETA}'  >  [3 de 5] Sitio destino"
   aviso_navegacion
-  say "  ${C_RD}${C_B}Atencion:${C_R} restaurar reemplaza por completo la base de datos y los"
-  say "  adjuntos del sitio que elija aqui. Lo que ese sitio tenga ahora se pierde."
+  say "  ${C_DIM}El respaldo se restaura completo: base de datos, archivos publicos y${C_R}"
+  say "  ${C_DIM}privados. Lo que ese sitio tenga ahora queda reemplazado.${C_R}"
   pedir_frappe_destino || return $?
 
-  if etiqueta_bk="$(alerta_mismo_sitio "$SITE")"; then
-    echo; hr
-    warn "El sitio '${SITE}' es el mismo que respalda el trabajo '${etiqueta_bk}'"
-    warn "de este servidor. Restaurar aqui sobrescribe ese sitio con una copia"
-    warn "anterior de si mismo. Es lo correcto para recuperarse de un desastre,"
-    warn "y es un error grave si lo que buscaba era refrescar otro sitio."
-    hr; echo
-    if ! confirmar_escribiendo "$SITE"; then
-      err "No coincide. No se acepta el sitio destino."
-      enter; return 2
-    fi
-    ok "Confirmado."
-  fi
+  echo; hr
+  say "  ${C_B}Acceso a la base de datos${C_R}"
+  say "  ${C_DIM}'bench restore' recrea la base del sitio y pide el usuario y la${C_R}"
+  say "  ${C_DIM}contrasena de root del motor. En una corrida programada nadie puede${C_R}"
+  say "  ${C_DIM}escribirlos, asi que se guardan con permisos 600.${C_R}"
   echo
-  say "  ${C_DIM}Carpeta de trabajo donde se arma el respaldo antes de restaurarlo.${C_R}"
-  say "  ${C_DIM}Va en /var/tmp y no en /tmp porque puede pesar varios GB.${C_R}"
-  pedir TEMP_LOCAL "Carpeta temporal de trabajo" "${TEMP_LOCAL:-/var/tmp/${JOB}}" || return $?
-  return 0
-}
-
-# ---------------------- [5] Base de datos ----------------------------
-rst_paso_basedatos() {
-  local r
-  pantalla "TRABAJO '${ETIQUETA}'  >  [5 de 9] Acceso a la base de datos"
-  aviso_navegacion
-  say "  ${C_DIM}'bench restore' borra y vuelve a crear la base de datos del sitio, y${C_R}"
-  say "  ${C_DIM}para eso pide la contrasena de root del motor (MariaDB/MySQL). En una${C_R}"
-  say "  ${C_DIM}restauracion programada nadie puede escribirla, asi que se guarda en${C_R}"
-  say "  ${C_DIM}${DB_CRED_FILE} con permisos 600.${C_R}"
+  info "Consultando como recibe bench esas opciones..."
+  detectar_flags_db
+  ok "Contrasena: ${DB_FLAG}${DB_USER_FLAG:+   usuario: ${DB_USER_FLAG}}"
+  [ -z "$DB_USER_FLAG" ] && warn "Esta version de bench no acepta el usuario como opcion."
   echo
-  info "Consultando que nombre usa esta version de bench para esa opcion..."
-  DB_FLAG="$(detectar_flag_db)"
-  if [ -n "$DB_FLAG" ]; then
-    ok "Esta version de bench la recibe como '${DB_FLAG}'."
-  else
-    warn "No se pudo determinar el nombre de la opcion."
-    say "    ${C_DIM}Se usara '--db-root-password', el nombre de las versiones actuales.${C_R}"
-    DB_FLAG="--db-root-password"
-  fi
+  pedir DB_USER "Usuario root de la base de datos" "${DB_USER:-root}" || return $?
+  pedir_secreto DB_ROOT_PASS "Contrasena de ${DB_USER}" || return $?
   echo
-  pedir_secreto DB_ROOT_PASS "Contrasena de root de la base de datos" || return $?
-  echo
-  info "Comprobando la contrasena..."
-  probar_password_db "$DB_ROOT_PASS"; r=$?
+  info "Comprobando..."
+  probar_password_db "$DB_USER" "$DB_ROOT_PASS"; r=$?
   case "$r" in
-    0) ok "La contrasena funciona contra el motor local.";;
-    2) warn "No hay cliente 'mysql' en este servidor; no se pudo comprobar.";;
-    *) err "El motor local rechazo esa contrasena."
-       say "    ${C_DIM}Puede ser correcta si la base de datos vive en otro servidor.${C_R}"
+    0) ok "Funciona contra el motor local."; sleep 1;;
+    2) warn "No hay cliente 'mysql'; no se pudo comprobar."; sleep 2;;
+    *) err "El motor local rechazo esas credenciales."
+       say "    ${C_DIM}Pueden ser correctas si la base de datos vive en otro servidor.${C_R}"
        echo
-       si_no_nav "Usarla de todas formas?"; local r2=$?
+       si_no_nav "Usarlas de todas formas?"; local r2=$?
        case "$r2" in 1) return 0;; 2|3) return "$r2";; esac;;
   esac
-  sleep 1
   return 0
 }
 
-# ------------------ [6] Respaldo de seguridad ------------------------
-rst_paso_previo() {
-  local r v
-  pantalla "TRABAJO '${ETIQUETA}'  >  [6 de 9] Respaldo de seguridad"
-  aviso_navegacion
-  say "  Antes de sobrescribir el sitio, el gestor puede respaldarlo. Es la unica"
-  say "  forma de volver atras si el respaldo restaurado no era el que esperaba."
-  echo
-  say "  ${C_DIM}Se guarda en ${PREVIO_DIR}, fuera de la carpeta de respaldos del sitio,${C_R}"
-  say "  ${C_DIM}para que el gestor de respaldos no se lo lleve al NAS o al Drive.${C_R}"
-  echo
-  si_no_nav "Respaldar el sitio destino antes de cada restauracion?"; r=$?
-  case "$r" in
-    0) PREVIO="si";;
-    1) PREVIO="no"
-       echo; warn "Sin respaldo previo no hay vuelta atras."
-       say "    ${C_DIM}Razonable solo si el sitio destino es descartable.${C_R}"
-       sleep 2; return 0;;
-    *) return "$r";;
-  esac
-  echo
-  say "  ${C_DIM}Cuantos respaldos de seguridad conservar. Los mas viejos se borran.${C_R}"
-  while true; do
-    read -rp "  Respaldos de seguridad a conservar [${PREVIO_CONSERVAR}]: " v || fin_entrada
-    v="${v:-$PREVIO_CONSERVAR}"
-    _nav_check "$v"; local n=$?
-    [ "$n" -ne 0 ] && return "$n"
-    [[ "$v" =~ ^[0-9]+$ ]] && { PREVIO_CONSERVAR="$v"; break; }
-    err "Escriba un numero entero (0 o mayor)."
-  done
-  return 0
-}
-
-# ------------------ [7] Despues de restaurar -------------------------
-rst_paso_posterior() {
-  local r op
-  pantalla "TRABAJO '${ETIQUETA}'  >  [7 de 9] Despues de restaurar"
-  aviso_navegacion
-  say "  ${C_DIM}Un sitio restaurado llega con la configuracion del sitio de origen:${C_R}"
-  say "  ${C_DIM}sus cuentas de correo, sus tareas programadas y sus usuarios.${C_R}"
-  echo
-  si_no_nav "Ejecutar 'bench migrate' despues de restaurar? (recomendado)"; r=$?
-  case "$r" in 0) MIGRAR="si";; 1) MIGRAR="no";; *) return "$r";; esac
-  echo
-  say "  Programador de tareas del sitio restaurado:"
-  say "    1) No tocarlo"
-  say "    2) Desactivarlo   ${C_DIM}(evita que una copia ejecute tareas de produccion)${C_R}"
-  say "    3) Activarlo"
-  while true; do
-    read -rp "  Opcion [1-3]: " op || fin_entrada
-    _nav_check "$op"; local n=$?
-    [ "$n" -ne 0 ] && return "$n"
-    case "$op" in
-      1) SCHEDULER="no-tocar"; break;;
-      2) SCHEDULER="desactivar"; break;;
-      3) SCHEDULER="activar"; break;;
-      *) err "Opcion invalida.";;
-    esac
-  done
-  echo
-  say "  ${C_DIM}Si restaura produccion sobre una copia de pruebas, esa copia puede${C_R}"
-  say "  ${C_DIM}enviar correos reales a clientes reales. Silenciarlos lo evita.${C_R}"
-  si_no_nav "Silenciar el correo saliente del sitio restaurado?"; r=$?
-  case "$r" in 0) MUTE_EMAILS="si";; 1) MUTE_EMAILS="no";; *) return "$r";; esac
-  echo
-  say "  ${C_DIM}La contrasena de Administrator sera la que tenia el sitio de origen.${C_R}"
-  si_no_nav "Cambiarla despues de cada restauracion?"; r=$?
-  case "$r" in
-    0) pedir_secreto ADMIN_PASS "Contrasena para Administrator" || return $?;;
-    1) ADMIN_PASS="";;
-    *) return "$r";;
-  esac
-  return 0
-}
-
-# ---------------------- [8] Programacion -----------------------------
+# ---------------------- [4] Programacion -----------------------------
 rst_paso_programacion() {
   local r
-  pantalla "TRABAJO '${ETIQUETA}'  >  [8 de 9] Programacion"
+  pantalla "TRABAJO '${ETIQUETA}'  >  [4 de 5] Programacion"
   aviso_navegacion
-  say "  Un trabajo programado revisa el origen a la hora indicada y, si hay un"
+  say "  El trabajo siempre se puede ejecutar a mano desde el menu. Ademas puede"
+  say "  quedar programado: a la hora indicada revisa el origen y, si hay un"
   say "  respaldo mas nuevo que el ultimo restaurado, lo restaura."
   echo
-  say "  ${C_DIM}Si no hay nada nuevo no toca el sitio: no repite trabajo ni riesgo.${C_R}"
-  say "  ${C_DIM}Mientras dura, el sitio queda en modo mantenimiento. Elija una hora${C_R}"
-  say "  ${C_DIM}en la que nadie lo este usando.${C_R}"
+  say "  ${C_DIM}Si no hay nada nuevo termina en segundos sin tocar el sitio, asi que${C_R}"
+  say "  ${C_DIM}conviene programarlo despues de cada respaldo. Si produccion respalda${C_R}"
+  say "  ${C_DIM}a las 12:00 y 18:00, una buena eleccion es 13:00,14:00,19:00,20:00.${C_R}"
   echo
   si_no_nav "Programar la restauracion automatica?"; r=$?
   case "$r" in
     1) AUTOMATICO="no"; HORARIOS=""; DIAS_CRON="*"
-       echo; info "El trabajo quedara solo para ejecutarlo a mano desde el menu."
+       echo; info "Quedara solo para ejecutarlo a mano."
        sleep 2; return 0;;
     2|3) return "$r";;
   esac
@@ -1818,44 +1750,39 @@ rst_paso_programacion() {
   return 0
 }
 
-# ---------------------- [9] Revision final ---------------------------
+# ---------------------- [5] Revision final ---------------------------
 rst_paso_resumen() {
   local op origen
   if [ "$TIPO" = "red" ]; then origen="${UNC}  (${MOUNT_POINT})"
   else origen="${RCLONE_REMOTE}:${DEST_PATH}"; fi
   while true; do
-    pantalla "TRABAJO '${ETIQUETA}'  >  [9 de 9] Revision final"
-    say "   ${C_B}1${C_R}) Etiqueta        : ${ETIQUETA}"
-    say "   ${C_B}2${C_R}) Origen          : ${origen}"
+    pantalla "TRABAJO '${ETIQUETA}'  >  [5 de 5] Revision final"
+    say "   ${C_B}1${C_R}) Etiqueta     : ${ETIQUETA}"
+    say "   ${C_B}2${C_R}) Origen       : ${origen}"
     [ -n "$ORIGEN_CONF" ] && \
-    say "                       ${C_DIM}heredado de $(basename "$ORIGEN_CONF")${C_R}"
-    say "   ${C_B}3${C_R}) Respaldos       : ${C_DIM}verificados en el paso 3${C_R}"
-    say "   ${C_B}4${C_R}) Sitio destino   : ${C_RD}${SITE}${C_R}   ${C_DIM}bench: ${BENCH_PATH}  usuario: ${BENCH_USER}${C_R}"
-    say "   ${C_B}5${C_R}) Base de datos   : contrasena de root guardada   ${C_DIM}${DB_FLAG}${C_R}"
-    if [ "$PREVIO" = "si" ]; then
-      say "   ${C_B}6${C_R}) Respaldo previo : si, conservando ${PREVIO_CONSERVAR}   ${C_DIM}${PREVIO_DIR}${C_R}"
-    else
-      say "   ${C_B}6${C_R}) Respaldo previo : ${C_RD}no${C_R}"
-    fi
-    say "   ${C_B}7${C_R}) Despues         : migrate=${MIGRAR}  programador=${SCHEDULER}  correo=$([ "$MUTE_EMAILS" = si ] && echo silenciado || echo intacto)$([ -n "$ADMIN_PASS" ] && echo "  admin=nueva")"
+    say "                    ${C_DIM}heredado de $(basename "$ORIGEN_CONF")${C_R}"
+    say "   ${C_B}3${C_R}) Sitio destino: ${C_B}${SITE}${C_R}"
+    say "                    ${C_DIM}bench: ${BENCH_PATH}   usuario: ${BENCH_USER}   base: ${DB_USER}${C_R}"
     if [ "$AUTOMATICO" = "si" ]; then
-      say "   ${C_B}8${C_R}) Programacion    : ${HORARIOS}  ($(describir_dias "$DIAS_CRON"))"
+      say "   ${C_B}4${C_R}) Programacion : ${HORARIOS}  ($(describir_dias "$DIAS_CRON"))"
     else
-      say "   ${C_B}8${C_R}) Programacion    : solo manual"
+      say "   ${C_B}4${C_R}) Programacion : solo manual"
     fi
     echo
-    say "   ${C_B}s${C_R}) Crear el trabajo con estos datos"
+    say "  ${C_DIM}Restaura completo: base de datos, archivos publicos y privados.${C_R}"
+    say "  ${C_DIM}Despues se ejecuta 'bench migrate'. El resto de ajustes -programador,${C_R}"
+    say "  ${C_DIM}correo, apps a excluir, respaldo previo- estan en 'Opciones' dentro${C_R}"
+    say "  ${C_DIM}del trabajo, con valores por defecto que ya sirven.${C_R}"
+    echo
+    say "   ${C_B}s${C_R}) Crear el trabajo"
     say "   ${C_B}x${C_R}) Cancelar sin crear nada"
     echo
-    say "  ${C_DIM}Crear el trabajo no restaura nada todavia.${C_R}"
-    say "  ${C_DIM}Escriba el numero del dato que quiera corregir.${C_R}"
-    read -rp "  Opcion: " op || fin_entrada
+    read -rp "  Opcion, o numero del dato a corregir: " op || fin_entrada
     case "${op,,}" in
       s|si) break;;
       x|cancelar) return 3;;
       v) return 2;;
-      3) err "Ese paso solo verifica; corrija el origen con 2."; sleep 2;;
-      [1-9]) paso="$op"; return 4;;
+      [1-4]) paso="$op"; return 4;;
       *) err "Opcion invalida."; sleep 1;;
     esac
   done
@@ -1877,9 +1804,11 @@ rst_paso_resumen() {
     "RCLONE_REMOTE=${RCLONE_REMOTE}" "DEST_PATH=${DEST_PATH}" \
     "RCLONE_CONFIG=/root/.config/rclone/rclone.conf" \
     "BENCH_PATH=${BENCH_PATH}" "BENCH_USER=${BENCH_USER}" "SITE=${SITE}" \
-    "DB_CRED_FILE=${DB_CRED_FILE}" "DB_FLAG=${DB_FLAG}" "TEMP_LOCAL=${TEMP_LOCAL}" \
+    "DB_CRED_FILE=${DB_CRED_FILE}" "DB_USER=${DB_USER}" \
+    "DB_FLAG=${DB_FLAG}" "DB_USER_FLAG=${DB_USER_FLAG}" "TEMP_LOCAL=${TEMP_LOCAL}" \
     "PREVIO=${PREVIO}" "PREVIO_DIR=${PREVIO_DIR}" "PREVIO_CONSERVAR=${PREVIO_CONSERVAR}" \
     "MIGRAR=${MIGRAR}" "SCHEDULER=${SCHEDULER}" "MUTE_EMAILS=${MUTE_EMAILS}" \
+    "EXCLUIR_APPS=${EXCLUIR_APPS}" \
     "AUTOMATICO=${AUTOMATICO}" "HORARIOS=${HORARIOS}" "DIAS_CRON=${DIAS_CRON}" \
     "LOG_FILE=${LOG_FILE}" "RCLONE_LOG=${RCLONE_LOG}" "STATE_FILE=${STATE_FILE}"
 
@@ -1897,7 +1826,7 @@ rst_paso_resumen() {
   if [ "$AUTOMATICO" = "si" ]; then
     say "    horario: ${HORARIOS}  ($(describir_dias "$DIAS_CRON"))"
   else
-    say "    horario: ${C_DIM}sin programacion; se ejecuta desde el menu${C_R}"
+    say "    horario: ${C_DIM}solo manual${C_R}"
   fi
   echo; hr
   say "  ${C_DIM}Nada se ha restaurado todavia.${C_R}"
@@ -1912,21 +1841,18 @@ rst_paso_resumen() {
 }
 
 # ===================== EJECUTAR UNA RESTAURACION =====================
-# Pantalla de confirmacion comun a toda restauracion real.
-confirmar_restauracion() {   # $1 = ruta del respaldo
-  local ruta="$1"
+confirmar_restauracion() {   # $1 = ruta del respaldo  $2 = fecha legible
   echo; hr
-  say "  ${C_RD}${C_B}Esto reemplaza el sitio '${SITE}' por completo.${C_R}"
-  say "  Respaldo a restaurar : ${C_B}${ruta}${C_R}"
-  say "  Sitio destino        : ${C_B}${SITE}${C_R}   ${C_DIM}(${BENCH_PATH})${C_R}"
-  if [ "${PREVIO:-si}" = "si" ]; then
-    say "  Respaldo de seguridad: ${C_GR}si${C_R}, en ${PREVIO_DIR}"
+  say "  Respaldo : ${C_B}${1}${C_R}   ${C_DIM}${2:-}${C_R}"
+  say "  Sitio    : ${C_B}${SITE}${C_R}   ${C_DIM}${BENCH_PATH}${C_R}"
+  say "  Se restaura completo: base de datos, archivos publicos y privados."
+  if [ "${PREVIO:-no}" = "si" ]; then
+    say "  Respaldo de seguridad previo: ${C_GR}si${C_R}"
   else
-    say "  Respaldo de seguridad: ${C_RD}no${C_R}  ${C_DIM}- no habra vuelta atras${C_R}"
+    say "  ${C_DIM}Sin respaldo de seguridad previo: el sitio actual se pierde.${C_R}"
   fi
-  say "  El sitio quedara en mantenimiento mientras dure."
   hr; echo
-  confirmar_escribiendo "$SITE"
+  si_no "Confirma restaurar sobre '${SITE}'?"
 }
 
 correr_script() {   # $@ = argumentos para el script del trabajo
@@ -1945,42 +1871,75 @@ correr_script() {   # $@ = argumentos para el script del trabajo
   return "$estado"
 }
 
+# Selector en dos niveles: primero el mes, despues el respaldo de ese mes.
+# Con meses de historial una lista plana es inmanejable.
 restaurar_eligiendo() {
-  local conf="$1" lineas=() i op f r scr
+  local conf="$1" lineas=() meses=() delmes=() scr m mm anio cnt ult op i f r
   cargar_conf "$conf"
   scr="${BIN_DIR}/${JOB_NOMBRE}.sh"
-  pantalla "TRABAJO '${ETIQUETA}'  >  Elegir respaldo"
+  pantalla "TRABAJO '${ETIQUETA}'  >  Restaurar"
   info "Leyendo los respaldos disponibles en el origen..."
-  mapfile -t lineas < <("$scr" --listar 2>/dev/null | head -n 30)
+  mapfile -t lineas < <("$scr" --listar 2>/dev/null)
   if [ "${#lineas[@]}" -eq 0 ]; then
     echo; err "No se encontro ningun respaldo en el origen."
     say "    ${C_DIM}Use el diagnostico para ver si el origen esta accesible.${C_R}"
     enter; return 1
   fi
-  echo
-  say "  Respaldos disponibles, del mas reciente al mas antiguo:"
-  echo
-  for i in "${!lineas[@]}"; do
-    f="${lineas[$i]%%|*}"; r="${lineas[$i]#*|}"
-    printf '%b\n' "    ${C_B}$((i+1))${C_R}) ${r}   ${C_DIM}(${f})${C_R}"
-  done
-  echo
-  say "    ${C_B}0${C_R}) Volver sin restaurar"
-  echo
+  mapfile -t meses < <(printf '%s\n' "${lineas[@]}" | cut -c1-7 | awk 'NF && !v[$0]++')
+
   while true; do
-    read -rp "  Numero del respaldo a restaurar: " op || fin_entrada
-    [ "$op" = "0" ] && return 0
-    if [[ "$op" =~ ^[0-9]+$ ]] && [ "$op" -ge 1 ] && [ "$op" -le "${#lineas[@]}" ]; then
-      r="${lineas[$((op-1))]#*|}"
-      if confirmar_restauracion "$r"; then
-        pantalla "TRABAJO '${ETIQUETA}'  >  Restaurando ${r}"
-        correr_script --ruta "$r"
-      else
-        err "No coincide. No se restauro nada."; enter
+    pantalla "TRABAJO '${ETIQUETA}'  >  Restaurar"
+    say "  Respaldos disponibles en el origen, por mes:"
+    echo
+    for i in "${!meses[@]}"; do
+      m="${meses[$i]}"; anio="${m%%-*}"; mm="${m#*-}"
+      cnt="$(printf '%s\n' "${lineas[@]}" | grep -c "^${m}")"
+      ult="$(printf '%s\n' "${lineas[@]}" | grep -m1 "^${m}")"
+      printf '%b\n' "    ${C_B}$((i+1))${C_R}) $(nombre_mes "$mm") ${anio}   ${C_DIM}${cnt} respaldo(s)   ultimo: ${ult%%|*}${C_R}"
+    done
+    echo
+    say "    ${C_B}u${C_R}) Restaurar el mas reciente de todos"
+    say "    ${C_B}0${C_R}) Volver sin restaurar"
+    echo
+    read -rp "  Numero del mes, o letra: " op || fin_entrada
+    case "${op,,}" in
+      0) return 0;;
+      u) r="${lineas[0]#*|}"; f="${lineas[0]%%|*}"
+         if confirmar_restauracion "$r" "$f"; then
+           pantalla "TRABAJO '${ETIQUETA}'  >  Restaurando ${r}"
+           correr_script --ruta "$r"
+         fi
+         return 0;;
+      *) if ! [[ "$op" =~ ^[0-9]+$ ]] || [ "$op" -lt 1 ] || [ "$op" -gt "${#meses[@]}" ]; then
+           err "Opcion invalida."; sleep 1; continue
+         fi;;
+    esac
+    m="${meses[$((op-1))]}"; mm="${m#*-}"; anio="${m%%-*}"
+    mapfile -t delmes < <(printf '%s\n' "${lineas[@]}" | grep "^${m}")
+
+    while true; do
+      pantalla "TRABAJO '${ETIQUETA}'  >  $(nombre_mes "$mm") ${anio}"
+      say "  Del mas reciente al mas antiguo:"
+      echo
+      for i in "${!delmes[@]}"; do
+        f="${delmes[$i]%%|*}"; r="${delmes[$i]#*|}"
+        printf '%b\n' "    ${C_B}$((i+1))${C_R}) ${r}   ${C_DIM}(${f})${C_R}"
+      done
+      echo
+      say "    ${C_B}0${C_R}) Volver a los meses"
+      echo
+      read -rp "  Numero del respaldo a restaurar: " op || fin_entrada
+      [ "$op" = "0" ] && break
+      if [[ "$op" =~ ^[0-9]+$ ]] && [ "$op" -ge 1 ] && [ "$op" -le "${#delmes[@]}" ]; then
+        r="${delmes[$((op-1))]#*|}"; f="${delmes[$((op-1))]%%|*}"
+        if confirmar_restauracion "$r" "$f"; then
+          pantalla "TRABAJO '${ETIQUETA}'  >  Restaurando ${r}"
+          correr_script --ruta "$r"
+        fi
+        return 0
       fi
-      return 0
-    fi
-    err "Opcion invalida."
+      err "Opcion invalida."; sleep 1
+    done
   done
 }
 
@@ -1996,11 +1955,9 @@ restaurar_reciente() {
   fi
   r="${linea#*|}"
   echo; ok "Mas reciente: ${C_B}${r}${C_R}  ${C_DIM}(${linea%%|*})${C_R}"
-  if confirmar_restauracion "$r"; then
+  if confirmar_restauracion "$r" "${linea%%|*}"; then
     pantalla "TRABAJO '${ETIQUETA}'  >  Restaurando ${r}"
     correr_script --ultimo --forzar
-  else
-    err "No coincide. No se restauro nada."; enter
   fi
   return 0
 }
@@ -2009,15 +1966,15 @@ prueba_en_seco() {
   local conf="$1"
   cargar_conf "$conf"
   pantalla "TRABAJO '${ETIQUETA}'  >  Prueba en seco"
-  say "  Trae el respaldo mas reciente, comprueba que el archivo de base de datos"
-  say "  no este danado y termina. ${C_B}No toca el sitio ${SITE}.${C_R}"
+  say "  Trae el respaldo mas reciente, comprueba que no este danado y termina."
+  say "  ${C_B}No toca el sitio ${SITE}.${C_R}"
   echo
   correr_script --ultimo --forzar --simular
 }
 
 # ======================= MENU DE UN TRABAJO ==========================
 menu_horarios() {
-  local conf="$1" op i horas=() nueva lista quitar resto r
+  local conf="$1" op i horas=() nueva lista quitar resto
   while true; do
     cargar_conf "$conf"
     pantalla "TRABAJO '${ETIQUETA}'  >  Programacion"
@@ -2092,30 +2049,29 @@ menu_horarios() {
 }
 
 editar_origen() {
-  local conf="$1" nuevo nmp nvers nopts sal nrem
+  local conf="$1" op nuevo nmp nvers nopts sal nrem
   cargar_conf "$conf"
   if [ "$JOB_TIPO" = "red" ]; then
     pantalla "TRABAJO '${ETIQUETA}'  >  Origen de red"
     say "  Actual : ${C_B}${UNC}${C_R}"
     say "  Montaje: ${MOUNT_POINT}"
-    [ -n "$ORIGEN_CONF" ] && say "  ${C_DIM}Heredado de $(basename "$ORIGEN_CONF")${C_R}"
+    [ -n "${ORIGEN_CONF:-}" ] && say "  ${C_DIM}Heredado de $(basename "$ORIGEN_CONF")${C_R}"
     echo
     say "   1) Montar ahora"
     say "   2) Cambiar la cadena de conexion y el punto de montaje"
     say "   0) Volver"
     echo
-    read -rp "  Opcion: " nuevo || fin_entrada
-    case "$nuevo" in
+    read -rp "  Opcion: " op || fin_entrada
+    case "$op" in
       1) systemctl daemon-reload >/dev/null 2>&1
          sal="$(mount "$MOUNT_POINT" 2>&1)"
          if mountpoint -q "$MOUNT_POINT"; then
            ok "Montado."; df -h "$MOUNT_POINT" | tail -n1 | sed 's/^/    /'
          else explicar_error_mount "$sal"; fi;;
-      2) if [ "$MONTAJE_PROPIO" != "si" ]; then
-           warn "Este montaje pertenece al gestor de respaldos ($(basename "$ORIGEN_CONF"))."
-           say "    ${C_DIM}Cambiarlo desde aqui afectaria tambien a los respaldos.${C_R}"
-           si_no "Aun asi desea tomarlo bajo control de este trabajo?" || { enter; return 0; }
-           MONTAJE_PROPIO="si"; set_conf "$conf" MONTAJE_PROPIO "si"; set_conf "$conf" ORIGEN_CONF ""
+      2) if [ "${MONTAJE_PROPIO:-no}" != "si" ]; then
+           warn "Este montaje pertenece al gestor de respaldos."
+           si_no "Tomarlo bajo control de este trabajo?" || { enter; return 0; }
+           set_conf "$conf" MONTAJE_PROPIO "si"; set_conf "$conf" ORIGEN_CONF ""
          fi
          while true; do
            pedir nuevo "Nueva cadena de conexion"
@@ -2153,42 +2109,81 @@ editar_origen() {
   enter
 }
 
-editar_posterior() {
-  local conf="$1" op r p
+# Reescribe el archivo de credenciales conservando lo que no se cambia.
+actualizar_dbcred() {   # $1=conf  $2=db (vacio = conservar)  $3=admin
+  local conf="$1" nueva_db="$2" nuevo_admin="$3" db=""
+  cargar_conf "$conf"
+  if [ -r "$DB_CRED_FILE" ]; then
+    db="$( . "$DB_CRED_FILE" >/dev/null 2>&1; printf '%s' "${DB_ROOT_PASS:-}" )"
+  fi
+  [ -n "$nueva_db" ] && db="$nueva_db"
+  {
+    printf '# Credenciales de restauracion - iZone ENTERPRISE\n'
+    printf 'DB_ROOT_PASS=%q\n' "$db"
+    printf 'ADMIN_PASS=%q\n' "$nuevo_admin"
+  } > "$DB_CRED_FILE"
+  chmod 600 "$DB_CRED_FILE"
+}
+
+leer_admin_pass() {   # $1 = conf ya cargado
+  [ -r "${DB_CRED_FILE:-}" ] || { printf ''; return; }
+  ( . "$DB_CRED_FILE" >/dev/null 2>&1; printf '%s' "${ADMIN_PASS:-}" )
+}
+
+menu_opciones() {
+  local conf="$1" op r p u d sal apps adm
   while true; do
     cargar_conf "$conf"
-    pantalla "TRABAJO '${ETIQUETA}'  >  Despues de restaurar"
-    say "  Sitio destino  : ${C_B}${SITE}${C_R}"
-    say "  bench migrate  : ${MIGRAR}"
-    say "  Programador    : ${SCHEDULER}"
-    say "  Correo saliente: $([ "$MUTE_EMAILS" = si ] && echo "silenciado" || echo "intacto")"
+    adm="$(leer_admin_pass)"
+    pantalla "TRABAJO '${ETIQUETA}'  >  Opciones"
+    say "  ${C_DIM}Valores que no se preguntan al crear el trabajo. Los de fabrica ya${C_R}"
+    say "  ${C_DIM}sirven para el uso normal.${C_R}"
     echo
-    say "   1) Cambiar el sitio destino"
-    say "   2) Ejecutar 'bench migrate' si/no"
-    say "   3) Programador de tareas"
-    say "   4) Silenciar el correo saliente si/no"
-    say "   5) Contrasena de Administrator despues de restaurar"
+    say "   1) Sitio destino          : ${C_B}${SITE}${C_R}  ${C_DIM}(${BENCH_PATH}, usuario ${BENCH_USER})${C_R}"
+    say "   2) Base de datos          : usuario ${DB_USER:-root}, contrasena guardada"
+    say "   3) Ejecutar bench migrate : ${MIGRAR:-si}"
+    say "   4) Programador de tareas  : ${SCHEDULER:-no-tocar}"
+    say "   5) Correo saliente        : $([ "${MUTE_EMAILS:-no}" = si ] && echo silenciado || echo intacto)"
+    say "   6) Contrasena Administrator: $([ -n "$adm" ] && echo "se cambia en cada restauracion" || echo "la del respaldo")"
+    say "   7) Apps a excluir         : ${EXCLUIR_APPS:-${C_DIM}ninguna${C_R}}"
+    say "   8) Respaldo previo        : $([ "${PREVIO:-no}" = si ] && echo "si, conserva ${PREVIO_CONSERVAR}" || echo no)"
+    if [ "$JOB_TIPO" = "red" ] && [ "${MONTAJE_PROPIO:-no}" = "si" ]; then
+    say "   9) Credenciales del recurso de red"
+    fi
     say "   0) Volver"
     echo
     read -rp "  Opcion: " op || fin_entrada
     case "$op" in
       1) pantalla "TRABAJO '${ETIQUETA}'  >  Sitio destino"
-         say "  ${C_RD}${C_B}Cuidado:${C_R} el sitio que elija aqui sera el que se sobrescriba."
+         say "  ${C_DIM}El sitio que elija aqui sera el que se sobrescriba en cada restauracion.${C_R}"
          if pedir_frappe_destino; then
-           if p="$(alerta_mismo_sitio "$SITE")"; then
-             echo; warn "El sitio '${SITE}' es el que respalda el trabajo '${p}' de este servidor."
-             confirmar_escribiendo "$SITE" || { err "No coincide. Sin cambios."; enter; continue; }
-           fi
            set_conf "$conf" BENCH_PATH "$BENCH_PATH"
            set_conf "$conf" BENCH_USER "$BENCH_USER"
            set_conf "$conf" SITE "$SITE"
-           DB_FLAG="$(detectar_flag_db)"
-           [ -n "$DB_FLAG" ] && set_conf "$conf" DB_FLAG "$DB_FLAG"
+           detectar_flags_db
+           set_conf "$conf" DB_FLAG "$DB_FLAG"
+           set_conf "$conf" DB_USER_FLAG "$DB_USER_FLAG"
            ok "Sitio destino actualizado."
          fi; enter;;
-      2) si_no "Ejecutar 'bench migrate' despues de restaurar?" && r=si || r=no
+      2) pedir u "Usuario root de la base de datos" "${DB_USER:-root}"
+         pedir_secreto p "Contrasena de ${u}"
+         info "Comprobando..."
+         probar_password_db "$u" "$p"
+         case "$?" in
+           0) ok "Funciona.";;
+           2) warn "No hay cliente 'mysql'; no se pudo comprobar.";;
+           *) err "El motor local las rechazo."
+              si_no "Guardarlas de todas formas?" || { enter; continue; };;
+         esac
+         set_conf "$conf" DB_USER "$u"
+         actualizar_dbcred "$conf" "$p" "$adm"
+         ok "Guardadas."; enter;;
+      3) si_no "Ejecutar 'bench migrate' despues de restaurar?" && r=si || r=no
          set_conf "$conf" MIGRAR "$r"; ok "Actualizado."; sleep 1;;
-      3) say "    1) No tocarlo   2) Desactivarlo   3) Activarlo"
+      4) echo
+         say "    1) No tocarlo"
+         say "    2) Desactivarlo   ${C_DIM}(evita que la copia ejecute tareas y webhooks reales)${C_R}"
+         say "    3) Activarlo"
          read -rp "  Opcion [1-3]: " r || fin_entrada
          case "$r" in
            1) set_conf "$conf" SCHEDULER "no-tocar";;
@@ -2197,68 +2192,47 @@ editar_posterior() {
            *) err "Opcion invalida."; sleep 1; continue;;
          esac
          ok "Actualizado."; sleep 1;;
-      4) si_no "Silenciar el correo saliente del sitio restaurado?" && r=si || r=no
+      5) say "  ${C_DIM}El sitio restaurado trae las cuentas de correo del origen.${C_R}"
+         si_no "Silenciar el correo saliente?" && r=si || r=no
          set_conf "$conf" MUTE_EMAILS "$r"; ok "Actualizado."; sleep 1;;
-      5) if si_no "Cambiar la contrasena de Administrator despues de cada restauracion?"; then
+      6) if si_no "Cambiar la contrasena de Administrator en cada restauracion?"; then
            pedir_secreto p "Contrasena para Administrator"
          else p=""; fi
          actualizar_dbcred "$conf" "" "$p"
          ok "Actualizado."; sleep 1;;
-      0) return 0;;
-      *) err "Opcion invalida."; sleep 1;;
-    esac
-  done
-}
-
-# Reescribe el archivo de credenciales conservando lo que no se cambia.
-actualizar_dbcred() {   # $1=conf  $2=db (vacio = conservar)  $3=admin (cadena vacia = borrar)
-  local conf="$1" nueva_db="$2" nuevo_admin="$3" db="" adm=""
-  cargar_conf "$conf"
-  if [ -r "$DB_CRED_FILE" ]; then
-    db="$( . "$DB_CRED_FILE" >/dev/null 2>&1; printf '%s' "${DB_ROOT_PASS:-}" )"
-    adm="$( . "$DB_CRED_FILE" >/dev/null 2>&1; printf '%s' "${ADMIN_PASS:-}" )"
-  fi
-  [ -n "$nueva_db" ] && db="$nueva_db"
-  adm="$nuevo_admin"
-  {
-    printf '# Credenciales de restauracion - iZone ENTERPRISE\n'
-    printf 'DB_ROOT_PASS=%q\n' "$db"
-    printf 'ADMIN_PASS=%q\n' "$adm"
-  } > "$DB_CRED_FILE"
-  chmod 600 "$DB_CRED_FILE"
-}
-
-editar_credenciales() {
-  local conf="$1" op u p d sal
-  cargar_conf "$conf"
-  while true; do
-    cargar_conf "$conf"
-    pantalla "TRABAJO '${ETIQUETA}'  >  Credenciales"
-    say "  Base de datos : ${DB_CRED_FILE}  ${C_DIM}permisos $(stat -c '%a' "$DB_CRED_FILE" 2>/dev/null || echo '?')${C_R}"
-    if [ "$JOB_TIPO" = "red" ]; then
-      say "  Recurso de red: ${CRED_FILE}  ${C_DIM}permisos $(stat -c '%a' "$CRED_FILE" 2>/dev/null || echo '?')${C_R}"
-      [ "$MONTAJE_PROPIO" != "si" ] && say "  ${C_DIM}Las credenciales del recurso pertenecen al gestor de respaldos.${C_R}"
-    fi
-    echo
-    say "   1) Cambiar la contrasena de root de la base de datos"
-    [ "$JOB_TIPO" = "red" ] && [ "$MONTAJE_PROPIO" = "si" ] && \
-    say "   2) Cambiar las credenciales del recurso compartido"
-    say "   0) Volver"
-    echo
-    read -rp "  Opcion: " op || fin_entrada
-    case "$op" in
-      1) pedir_secreto p "Contrasena de root de la base de datos"
-         info "Comprobando..."
-         probar_password_db "$p"
-         case "$?" in
-           0) ok "La contrasena funciona.";;
-           2) warn "No hay cliente 'mysql'; no se pudo comprobar.";;
-           *) err "El motor local la rechazo."
-              si_no "Guardarla de todas formas?" || { enter; continue; };;
-         esac
-         actualizar_dbcred "$conf" "$p" "$( . "$DB_CRED_FILE" >/dev/null 2>&1; printf '%s' "${ADMIN_PASS:-}" )"
-         ok "Guardada."; enter;;
-      2) [ "$JOB_TIPO" = "red" ] && [ "$MONTAJE_PROPIO" = "si" ] || { err "Opcion invalida."; sleep 1; continue; }
+      7) pantalla "TRABAJO '${ETIQUETA}'  >  Apps a excluir"
+         say "  Si el respaldo declara apps que este bench no tiene, 'bench migrate'"
+         say "  falla con 'No module named'. Indicarlas aqui hace que el gestor las"
+         say "  retire del sitio despues de restaurar y antes de migrar."
+         echo
+         say "  ${C_DIM}Nombres separados por espacio. Vacio para no excluir ninguna.${C_R}"
+         say "  ${C_DIM}Actual: ${EXCLUIR_APPS:-(ninguna)}${C_R}"
+         echo
+         read -rp "  Apps a excluir: " apps || fin_entrada
+         apps="$(printf '%s' "$apps" | tr -s ' ' | sed -e 's/^ *//' -e 's/ *$//')"
+         set_conf "$conf" EXCLUIR_APPS "$apps"
+         if [ -n "$apps" ] && ! command -v mysql >/dev/null 2>&1; then
+           warn "No hay cliente 'mysql' en este servidor; sin el no se pueden retirar."
+           enter
+         else
+           ok "Actualizado."; sleep 1
+         fi;;
+      8) pantalla "TRABAJO '${ETIQUETA}'  >  Respaldo de seguridad previo"
+         say "  Antes de sobrescribir, el gestor puede respaldar el sitio destino."
+         say "  Es la unica forma de volver atras, y duplica el tiempo de cada"
+         say "  restauracion. Para una copia desechable no suele valer la pena."
+         say "  ${C_DIM}Se guarda en ${PREVIO_DIR}${C_R}"
+         echo
+         if si_no "Activar el respaldo previo?"; then
+           set_conf "$conf" PREVIO "si"
+           read -rp "  Cuantos conservar [${PREVIO_CONSERVAR:-3}]: " r || fin_entrada
+           r="${r:-${PREVIO_CONSERVAR:-3}}"
+           [[ "$r" =~ ^[0-9]+$ ]] && set_conf "$conf" PREVIO_CONSERVAR "$r"
+         else
+           set_conf "$conf" PREVIO "no"
+         fi
+         ok "Actualizado."; sleep 1;;
+      9) [ "$JOB_TIPO" = "red" ] && [ "${MONTAJE_PROPIO:-no}" = "si" ] || { err "Opcion invalida."; sleep 1; continue; }
          pedir u "Usuario del recurso compartido"
          pedir_secreto p "Contrasena"
          pedir d "Dominio o grupo de trabajo" "WORKGROUP"
@@ -2274,51 +2248,12 @@ editar_credenciales() {
   done
 }
 
-editar_previo() {
-  local conf="$1" op v n
-  while true; do
-    cargar_conf "$conf"
-    pantalla "TRABAJO '${ETIQUETA}'  >  Respaldo de seguridad"
-    say "  Activo     : $([ "${PREVIO:-si}" = si ] && printf '%b' "${C_GR}si${C_R}" || printf '%b' "${C_RD}no${C_R}")"
-    say "  Carpeta    : ${PREVIO_DIR}"
-    say "  Se conservan: ${PREVIO_CONSERVAR}"
-    n="$(ls -1d "${PREVIO_DIR}"/*/ 2>/dev/null | wc -l)"
-    say "  Guardados  : ${n}"
-    if [ "$n" -gt 0 ]; then
-      echo; say "  ${C_DIM}Del mas reciente al mas antiguo:${C_R}"
-      ls -1dt "${PREVIO_DIR}"/*/ 2>/dev/null | head -n 5 | sed 's/^/    /'
-      say "  ${C_DIM}Para volver atras: restaure a mano con 'bench restore' desde uno${C_R}"
-      say "  ${C_DIM}de esos archivos.${C_R}"
-    fi
-    echo
-    say "   1) Activar o desactivar el respaldo previo"
-    say "   2) Cambiar cuantos se conservan"
-    say "   0) Volver"
-    echo
-    read -rp "  Opcion: " op || fin_entrada
-    case "$op" in
-      1) if si_no "Respaldar el sitio destino antes de cada restauracion?"; then
-           set_conf "$conf" PREVIO "si"
-         else
-           warn "Sin respaldo previo no hay vuelta atras."
-           si_no "Confirma desactivarlo?" && set_conf "$conf" PREVIO "no"
-         fi
-         ok "Actualizado."; sleep 1;;
-      2) read -rp "  Cuantos conservar: " v || fin_entrada
-         if [[ "$v" =~ ^[0-9]+$ ]]; then set_conf "$conf" PREVIO_CONSERVAR "$v"; ok "Actualizado."
-         else err "Escriba un numero entero."; fi; sleep 1;;
-      0) return 0;;
-      *) err "Opcion invalida."; sleep 1;;
-    esac
-  done
-}
-
 eliminar_trabajo() {
   local conf="$1"
   cargar_conf "$conf"
   pantalla "TRABAJO '${ETIQUETA}'  >  Eliminar"
   warn "Se quitara la programacion, el script y la configuracion."
-  say "  ${C_DIM}Los respaldos del origen no se tocan: el montaje es de solo lectura.${C_R}"
+  say "  ${C_DIM}Los respaldos del origen no se tocan.${C_R}"
   si_no "Confirma eliminar el trabajo '${JOB_NOMBRE}'?" || { enter; return 1; }
   cron_aplicar "$JOB_NOMBRE" ""
   rm -f "${BIN_DIR}/${JOB_NOMBRE}.sh" "$STATE_FILE" "$DB_CRED_FILE"
@@ -2332,7 +2267,6 @@ eliminar_trabajo() {
   if [ -d "${PREVIO_DIR:-}" ] && [ -n "$(ls -A "$PREVIO_DIR" 2>/dev/null)" ]; then
     echo
     warn "Quedan respaldos de seguridad en ${PREVIO_DIR}."
-    say "  ${C_DIM}Son la unica copia del sitio anterior a cada restauracion.${C_R}"
     si_no "Borrarlos tambien?" && rm -rf "$PREVIO_DIR"
   fi
   rm -f "$conf"
@@ -2356,7 +2290,6 @@ menu_trabajo() {
       say "  Origen  : ${RCLONE_REMOTE}:${DEST_PATH}"
     fi
     say "  Destino : sitio ${C_B}${SITE}${C_R}   ${C_DIM}${BENCH_PATH}  (usuario ${BENCH_USER})${C_R}"
-    say "  Previo  : $([ "${PREVIO:-si}" = si ] && echo "si, conserva ${PREVIO_CONSERVAR}" || printf '%b' "${C_RD}no${C_R}")"
     if [ "${AUTOMATICO:-no}" = "si" ]; then
       say "  Horario : ${HORARIOS}   ($(describir_dias "$DIAS_CRON"))"
     else
@@ -2364,16 +2297,15 @@ menu_trabajo() {
     fi
     ultimo="$(cat "$STATE_FILE" 2>/dev/null)"
     say "  Ultimo  : ${ultimo:-${C_DIM}ninguno restaurado todavia${C_R}}"
+    [ -n "${EXCLUIR_APPS:-}" ] && say "  Excluye : ${EXCLUIR_APPS}"
     echo
-    say "   1) ${C_YL}Restaurar un respaldo de la lista${C_R}"
+    say "   1) ${C_YL}Restaurar${C_R}  ${C_DIM}(elegir mes y respaldo)${C_R}"
     say "   2) ${C_YL}Restaurar el mas reciente${C_R}"
-    say "   3) Prueba en seco (no toca el sitio)"
-    say "   4) Programacion automatica"
+    say "   3) Prueba en seco   ${C_DIM}(no toca el sitio)${C_R}"
+    say "   4) Programacion"
     say "   5) Origen de los respaldos"
-    say "   6) Sitio destino y acciones posteriores"
-    say "   7) Respaldo de seguridad"
-    say "   8) Ver configuracion y log"
-    say "   9) Credenciales"
+    say "   6) Opciones del trabajo"
+    say "   7) Ver configuracion y log"
     say "   d) ${C_RD}Eliminar este trabajo${C_R}"
     say "   0) Volver"
     echo
@@ -2384,9 +2316,8 @@ menu_trabajo() {
       3) prueba_en_seco "$conf";;
       4) menu_horarios "$conf";;
       5) editar_origen "$conf";;
-      6) editar_posterior "$conf";;
-      7) editar_previo "$conf";;
-      8) pantalla "TRABAJO '${ETIQUETA}'  >  Configuracion"
+      6) menu_opciones "$conf";;
+      7) pantalla "TRABAJO '${ETIQUETA}'  >  Configuracion"
          sed 's/^/    /' "$conf"; echo
          if [ "${AUTOMATICO:-no}" = "si" ]; then
            say "  ${C_B}Cron activo:${C_R}"; cron_mostrar "$JOB_NOMBRE"; echo
@@ -2394,7 +2325,6 @@ menu_trabajo() {
          say "  ${C_B}Ultimas lineas del log:${C_R}"
          tail -n 15 "$LOG_FILE" 2>/dev/null | sed 's/^/    /' || warn "Sin registros."
          enter;;
-      9) editar_credenciales "$conf";;
       d) eliminar_trabajo "$conf" && return 0;;
       0) return 0;;
       *) err "Opcion invalida."; sleep 1;;
@@ -2410,9 +2340,7 @@ menu_trabajos() {
     mapfile -t confs < <(listar_confs)
     if [ "${#confs[@]}" -eq 0 ]; then
       warn "No hay ningun trabajo de restauracion configurado todavia."
-      say "  ${C_DIM}Un trabajo es un origen de respaldos mas un sitio destino. Puede${C_R}"
-      say "  ${C_DIM}quedar programado para mantener una copia al dia, o guardarse solo${C_R}"
-      say "  ${C_DIM}para restaurar a mano cuando haga falta.${C_R}"
+      say "  ${C_DIM}Un trabajo es un origen de respaldos mas un sitio destino.${C_R}"
     else
       for i in "${!confs[@]}"; do
         ( cargar_conf "${confs[$i]}"
@@ -2507,20 +2435,19 @@ diagnostico() {
       [ -d "$BENCH_PATH" ] && ok "bench: $BENCH_PATH" || err "No existe el bench: $BENCH_PATH"
       [ -f "$BENCH_PATH/env/bin/activate" ] && ok "entorno virtual presente" || err "Falta env/bin/activate"
       id "$BENCH_USER" >/dev/null 2>&1 && ok "usuario de bench: $BENCH_USER" || err "El usuario $BENCH_USER no existe"
-      [ -d "$BENCH_PATH/sites/$SITE" ] && ok "sitio: $SITE" || warn "aun no existe el sitio: $SITE"
+      [ -d "$BENCH_PATH/sites/$SITE" ] && ok "sitio: $SITE" || err "no existe el sitio ${SITE}: creelo con 'bench new-site'"
       [ -f "$DB_CRED_FILE" ] && ok "credenciales de base de datos: permisos $(stat -c '%a' "$DB_CRED_FILE")" \
                              || err "faltan las credenciales de base de datos"
+      [ -n "${DB_USER_FLAG:-}" ] && ok "usuario de base de datos: ${DB_USER:-root} (${DB_USER_FLAG})" \
+                                 || warn "esta version de bench no acepta el usuario como opcion"
+      if [ -n "${EXCLUIR_APPS:-}" ]; then
+        command -v mysql >/dev/null 2>&1 && ok "apps a excluir: ${EXCLUIR_APPS}" \
+          || err "hay apps a excluir pero falta el cliente 'mysql'"
+      fi
       scr="${BIN_DIR}/${JOB_NOMBRE}.sh"
       [ -x "$scr" ] && ok "script de restauracion presente" || err "falta el script $scr"
       echo
-      say "  ${C_B}Seguridad y programacion${C_R}"
-      if [ "${PREVIO:-si}" = "si" ]; then
-        n="$(ls -1d "${PREVIO_DIR}"/*/ 2>/dev/null | wc -l)"
-        ok "respaldo previo activo; guardados: ${n} de ${PREVIO_CONSERVAR}"
-        [ -d "$PREVIO_DIR" ] && du -sh "$PREVIO_DIR" 2>/dev/null | sed 's/^/    /'
-      else
-        warn "respaldo previo desactivado: una restauracion no tiene vuelta atras"
-      fi
+      say "  ${C_B}Estado${C_R}"
       if [ "${AUTOMATICO:-no}" = "si" ]; then
         n="$(cron_mostrar "$JOB_NOMBRE")"
         if [ -n "$n" ]; then ok "cron activo:"; printf '%s\n' "$n"
@@ -2529,6 +2456,8 @@ diagnostico() {
       else
         say "  ${C_DIM}sin programacion automatica${C_R}"
       fi
+      [ "${PREVIO:-no}" = "si" ] && ok "respaldo previo activo; conserva ${PREVIO_CONSERVAR}" \
+                                 || say "  ${C_DIM}sin respaldo previo${C_R}"
       ult="$(cat "$STATE_FILE" 2>/dev/null)"
       [ -n "$ult" ] && ok "ultimo respaldo restaurado: ${ult}" || warn "todavia no se ha restaurado nada"
       if [ -f "$LOG_FILE" ] && [ -s "$LOG_FILE" ]; then
@@ -2552,9 +2481,9 @@ menu_principal() {
     say "   3) Diagnostico"
     say "   0) Salir"
     echo
-    say "  ${C_DIM}Restaurar reemplaza por completo la base de datos y los adjuntos del${C_R}"
-    say "  ${C_DIM}sitio destino. Antes de hacerlo, el gestor respalda ese sitio para${C_R}"
-    say "  ${C_DIM}que siempre haya vuelta atras.${C_R}"
+    say "  ${C_DIM}Toma un respaldo hecho por iZone ENTERPRISE - BACKUPS desde el NAS o${C_R}"
+    say "  ${C_DIM}el Drive y lo restaura completo sobre un sitio de este servidor:${C_R}"
+    say "  ${C_DIM}base de datos, archivos publicos y privados.${C_R}"
     echo
     read -rp "  Opcion: " op || fin_entrada
     case "$op" in
