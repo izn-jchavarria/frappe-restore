@@ -2,9 +2,19 @@
 # =====================================================================
 #  iZONE ENTERPRISE - RESTAURACION
 #  Gestor de restauraciones para Frappe / ERPNext
-#  Origenes soportados: Unidad de Red (CIFS) y Google Drive (rclone)
+#  Origenes soportados: Unidad de Red (CIFS o rclone) y Google Drive (rclone)
 #  Restaura los respaldos producidos por iZone ENTERPRISE - BACKUPS
-#  Version: 2.0.0
+#  Version: 2.1.0
+#
+#  Un respaldo solo se restaura si llega integro. Desde la 2.1.0, antes de
+#  tocar el sitio se comprueba el SHA256SUMS que viaja con cada respaldo,
+#  que el volcado este completo y que los adjuntos se puedan leer. Las
+#  carpetas que el gestor de respaldos todavia esta enviando (.subiendo)
+#  nunca se ofrecen ni se restauran.
+#
+#  La Unidad de Red tiene dos caminos, igual que en el gestor de respaldos:
+#  montar el recurso por CIFS en solo lectura o, si el servidor no puede
+#  montar (un contenedor LXC sin privilegios), leerlo con rclone sin montar.
 #
 #  Uso:  sudo ./frappe-restore.sh
 # =====================================================================
@@ -22,6 +32,12 @@ HOST_SHORT="$(hostname -s 2>/dev/null || hostname)"
 BASE="${HOST_SHORT}-restore"
 RCLONE_ESPERA=150
 NAV_ON=0          # 1 dentro de los asistentes: habilita v=volver, x=cancelar
+# Version del codigo que se escribe en el script de cada trabajo. Si
+# cambia, al abrir el gestor se regeneran los scripts de TODOS los trabajos.
+GEN_VERSION_ACTUAL="2.1.0"
+# Copia de rclone con SMB que instala el gestor de respaldos (o este, si
+# hace falta). Es la misma ruta en los dos: se instala una sola vez.
+RCLONE_PRIV="/usr/local/lib/izone-backup/rclone"
 
 C_R=$'\033[0m'; C_B=$'\033[1m'; C_DIM=$'\033[2m'
 C_CY=$'\033[0;36m'; C_GR=$'\033[0;32m'; C_RD=$'\033[0;31m'; C_YL=$'\033[0;33m'
@@ -257,6 +273,7 @@ cargar_conf() {
         PREVIO PREVIO_DIR PREVIO_CONSERVAR \
         MIGRAR SCHEDULER MUTE_EMAILS EXCLUIR_APPS \
         AUTOMATICO HORARIOS DIAS_CRON \
+        METODO_RED ENTORNO RCLONE_BIN SIN_HUELLAS GEN_VERSION \
         LOG_FILE RCLONE_LOG STATE_FILE 2>/dev/null
   # shellcheck disable=SC1090
   . "$1"
@@ -344,7 +361,9 @@ asegurar_paquete() {
   local pkg="$1" cmd="$2"
   command -v "$cmd" >/dev/null 2>&1 && { ok "'$pkg' ya esta instalado."; return 0; }
   info "Instalando '$pkg'..."
-  apt-get update -qq && apt-get install -y "$pkg" >/dev/null 2>&1
+  # --no-remove: si apt necesitara eliminar paquetes para resolver la
+  # instalacion, aborta en vez de tocar el sistema.
+  apt-get update -qq; apt-get install -y --no-remove "$pkg" >/dev/null 2>&1
   if command -v "$cmd" >/dev/null 2>&1; then ok "'$pkg' instalado."; return 0
   else err "No se pudo instalar '$pkg'."; return 1; fi
 }
@@ -428,6 +447,212 @@ fstab_quitar() {
   cat "$tmp" > /etc/fstab; rm -f "$tmp"
   systemctl daemon-reload >/dev/null 2>&1
 }
+
+# ================ ENTORNO Y RED SIN MONTAJE (rclone) ==================
+# Tipo de contenedor (lxc, docker...) o vacio si no es un contenedor.
+entorno_contenedor() {
+  local c=""
+  c="$(systemd-detect-virt --container 2>/dev/null)" || c=""
+  [ "$c" = "none" ] && c=""
+  if [ -z "$c" ]; then
+    if [ -r /run/systemd/container ]; then
+      c="$(head -n 1 /run/systemd/container 2>/dev/null)"
+    elif [ -f /.dockerenv ]; then
+      c="docker"
+    else
+      c="$(tr '\0' '\n' 2>/dev/null < /proc/1/environ | sed -n 's/^container=//p' | head -n 1)"
+    fi
+  fi
+  printf '%s' "$c"
+}
+
+# 0 si el root de aqui no es el root real del equipo (espacio de usuarios
+# propio): es lo que tiene un contenedor sin privilegios.
+entorno_sin_privilegios() {
+  local m
+  m="$(awk 'NR==1 {print $1" "$2" "$3}' /proc/self/uid_map 2>/dev/null)"
+  [ -n "$m" ] && [ "$m" != "0 0 4294967295" ]
+}
+
+# Decide si tiene sentido intentar un montaje CIFS. Deja la descripcion
+# en ENTORNO_DESC y, si no se puede, el motivo en ENTORNO_MOTIVO.
+#   0 = se puede intentar   1 = el entorno no lo permite
+entorno_puede_montar() {
+  local c; c="$(entorno_contenedor)"
+  ENTORNO_MOTIVO=""
+  if [ -z "$c" ]; then
+    ENTORNO_DESC="servidor o maquina virtual"; return 0
+  fi
+  if entorno_sin_privilegios; then
+    ENTORNO_DESC="contenedor ${c} sin privilegios"
+    ENTORNO_MOTIVO="es un ${ENTORNO_DESC}: el sistema no permite montar carpetas de red"
+    return 1
+  fi
+  ENTORNO_DESC="contenedor ${c} con privilegios"
+  return 0
+}
+
+rclone_con_smb() {   # rclone_con_smb <binario>  -> 0 si trae el backend smb (v1.60+)
+  [ -n "${1:-}" ] && command -v "$1" >/dev/null 2>&1 || return 1
+  "$1" help backends 2>/dev/null | awk '{print $1}' | grep -qx smb
+}
+
+rclone_version_de() { "$1" version 2>/dev/null | head -n 1 | awk '{print $2}'; }
+
+# Descarga el rclone oficial y lo deja en RCLONE_PRIV. Comprueba la huella
+# SHA256 que publica rclone.org antes de instalar nada. El rclone del
+# sistema, que usan los trabajos de Drive, no se toca.
+instalar_rclone_privado() {
+  local arq ver base zip tmp bin
+  case "$(uname -m)" in
+    x86_64|amd64)  arq="amd64";;
+    aarch64|arm64) arq="arm64";;
+    armv7l)        arq="arm-v7";;
+    i?86)          arq="386";;
+    *) err "Arquitectura no soportada: $(uname -m)"; return 1;;
+  esac
+  command -v curl >/dev/null 2>&1 || asegurar_paquete curl curl || return 1
+  info "Consultando la version actual de rclone..."
+  ver="$(curl -fsSL --max-time 30 https://downloads.rclone.org/version.txt 2>/dev/null | awk '{print $2}')"
+  [[ "$ver" =~ ^v[0-9]+\.[0-9]+\.[0-9]+$ ]] || {
+    err "No se pudo consultar rclone.org. Revise la salida a internet del servidor."; return 1; }
+  base="https://downloads.rclone.org/${ver}"
+  zip="rclone-${ver}-linux-${arq}.zip"
+  tmp="$(mktemp -d)"
+  info "Descargando rclone ${ver}..."
+  if ! curl -fsSL --max-time 600 -o "${tmp}/${zip}" "${base}/${zip}" \
+     || ! curl -fsSL --max-time 60 -o "${tmp}/SHA256SUMS" "${base}/SHA256SUMS"; then
+    err "Fallo la descarga."; rm -rf "$tmp"; return 1
+  fi
+  if ! ( cd "$tmp" && awk -v f="$zip" '$2==f' SHA256SUMS | grep -q . \
+         && awk -v f="$zip" '$2==f' SHA256SUMS | sha256sum -c - >/dev/null 2>&1 ); then
+    err "La huella SHA256 de la descarga no coincide. No se instalo nada."
+    rm -rf "$tmp"; return 1
+  fi
+  ok "Huella SHA256 de la descarga verificada."
+  if command -v unzip >/dev/null 2>&1; then
+    unzip -q "${tmp}/${zip}" -d "$tmp" 2>/dev/null
+  else
+    python3 -I -m zipfile -e "${tmp}/${zip}" "$tmp" 2>/dev/null
+  fi
+  bin="${tmp}/rclone-${ver}-linux-${arq}/rclone"
+  [ -f "$bin" ] || { err "El paquete descargado no trae el binario esperado."; rm -rf "$tmp"; return 1; }
+  mkdir -p "$(dirname "$RCLONE_PRIV")"
+  install -m 755 "$bin" "${RCLONE_PRIV}.nuevo" && mv -f "${RCLONE_PRIV}.nuevo" "$RCLONE_PRIV"
+  rm -rf "$tmp"
+  if rclone_con_smb "$RCLONE_PRIV"; then
+    ok "rclone ${ver} instalado en ${RCLONE_PRIV}."; return 0
+  fi
+  err "La copia instalada no responde."; return 1
+}
+
+# Deja en RCLONE_BIN un rclone con soporte SMB: el del sistema si sirve,
+# si no la copia propia, y si tampoco existe ofrece instalarla.
+# 0 = listo   2 = volver   3 = cancelar
+red_asegurar_rclone() {
+  local sis r
+  sis="$(command -v rclone 2>/dev/null)"
+  if [ -n "$sis" ] && rclone_con_smb "$sis"; then
+    RCLONE_BIN="$sis"; ok "rclone $(rclone_version_de "$sis") del sistema, con soporte SMB."; return 0
+  fi
+  if rclone_con_smb "$RCLONE_PRIV"; then
+    RCLONE_BIN="$RCLONE_PRIV"; ok "rclone $(rclone_version_de "$RCLONE_PRIV") propio, con soporte SMB."; return 0
+  fi
+  if [ -n "$sis" ]; then
+    warn "El rclone de este servidor ($(rclone_version_de "$sis")) es anterior a la v1.60 y no trae SMB."
+  else
+    warn "rclone no esta instalado en este servidor."
+  fi
+  say "  ${C_DIM}Se puede descargar el rclone oficial SOLO para leer el NAS, en:${C_R}"
+  say "  ${C_DIM}  ${RCLONE_PRIV}${C_R}"
+  say "  ${C_DIM}No reemplaza ni modifica el rclone del sistema: los trabajos de Google${C_R}"
+  say "  ${C_DIM}Drive siguen usando el suyo. No reinicia ni detiene nada.${C_R}"
+  echo
+  si_no_nav "Descargar e instalar esa copia ahora?"; r=$?
+  case "$r" in
+    0) instalar_rclone_privado && { RCLONE_BIN="$RCLONE_PRIV"; return 0; }
+       enter; return 2;;
+    1) err "Sin un rclone con SMB este servidor no puede leer el NAS sin montarlo."
+       enter; return 3;;
+    *) return "$r";;
+  esac
+}
+
+# rclone hacia el NAS sin archivo de configuracion: la conexion se arma en
+# variables de entorno de un subproceso a partir del .cred, que sigue
+# siendo el unico lugar donde vive la contrasena. Nada se escribe en el
+# rclone.conf, asi que el NAS no aparece entre las cuentas de Drive.
+nas_usar() {   # nas_usar <servidor> <puerto> <archivo .cred> <rclone>
+  NAS_SRV="$1"; NAS_PUERTO="${2:-445}"; NAS_CRED="$3"; NAS_BIN="$4"
+}
+
+nas_rc() {   # nas_rc <argumentos de rclone>   (NAS_ESPERA=segundos para limitar)
+  ( u="$(sed -n 's/^username=//p' "$NAS_CRED" 2>/dev/null | head -n 1)"
+    p="$(sed -n 's/^password=//p' "$NAS_CRED" 2>/dev/null | head -n 1)"
+    d="$(sed -n 's/^domain=//p'   "$NAS_CRED" 2>/dev/null | head -n 1)"
+    if [ -z "$u" ] || [ -z "$p" ]; then
+      echo "No se pudieron leer las credenciales de ${NAS_CRED}" >&2; exit 98
+    fi
+    export RCLONE_CONFIG_IZONENAS_TYPE="smb"
+    export RCLONE_CONFIG_IZONENAS_HOST="$NAS_SRV"
+    export RCLONE_CONFIG_IZONENAS_PORT="$NAS_PUERTO"
+    export RCLONE_CONFIG_IZONENAS_USER="$u"
+    export RCLONE_CONFIG_IZONENAS_DOMAIN="${d:-WORKGROUP}"
+    RCLONE_CONFIG_IZONENAS_PASS="$(printf '%s' "$p" | "$NAS_BIN" obscure - 2>/dev/null)"
+    export RCLONE_CONFIG_IZONENAS_PASS
+    if [ -n "${NAS_ESPERA:-}" ]; then
+      exec timeout "$NAS_ESPERA" "$NAS_BIN" "$@" --contimeout 20s </dev/null
+    fi
+    exec "$NAS_BIN" "$@" --contimeout 20s </dev/null )
+}
+
+nas_explicar_error() {
+  local s="$1"
+  case "$s" in
+    *LOGON_FAILURE*|*"logon failure"*)
+      say "    ${C_DIM}Usuario o contrasena incorrectos.${C_R}";;
+    *BAD_NETWORK_NAME*)
+      say "    ${C_DIM}No existe esa carpeta compartida en el servidor.${C_R}";;
+    *ACCESS_DENIED*|*"access denied"*)
+      say "    ${C_DIM}El usuario no tiene permiso de lectura sobre esa carpeta.${C_R}";;
+    *"directory not found"*)
+      say "    ${C_DIM}Esa carpeta no existe dentro del recurso.${C_R}";;
+    *"connection refused"*|*"i/o timeout"*|*"no route"*|*"unreachable"*)
+      say "    ${C_DIM}No se alcanza el servidor por el puerto SMB.${C_R}";;
+  esac
+  [ -n "$s" ] && printf '%s\n' "$s" | grep -v '^[[:space:]]*$' | tail -n 4 | sed 's/^/    /'
+  return 0
+}
+
+# Prueba de lectura del origen, tal como la hara cada restauracion: listar
+# y leer un archivo. Solo lee: el usuario del NAS puede tener permiso de
+# solo lectura, y nada de esto escribe en el origen.
+nas_probar_lectura() {   # nas_probar_lectura <recurso/subcarpeta>
+  local base="$1" salida ult
+  info "Conectando con //${NAS_SRV}/${base} por rclone..."
+  if ! salida="$(NAS_ESPERA=90 nas_rc lsf "izonenas:${base}" --max-depth 1 2>&1)"; then
+    err "No se pudo abrir esa carpeta en el NAS."
+    nas_explicar_error "$salida"; return 1
+  fi
+  ok "Carpeta accesible."
+  ult="$(listar_respaldos_nas "$base" | head -n 1)"; ult="${ult#*|}"
+  if [ -n "$ult" ]; then
+    if NAS_ESPERA=90 nas_rc cat "izonenas:${base}/${ult}/SHA256SUMS" >/dev/null 2>&1; then
+      ok "Lectura real correcta: ${ult}/SHA256SUMS"
+    else
+      warn "No se pudo leer ${ult}/SHA256SUMS (puede ser un respaldo anterior a la 2.4.0)."
+    fi
+  fi
+  return 0
+}
+
+# Trabajo de red que va por rclone, sin montaje (requiere cargar_conf).
+es_red_rclone() { [ "${JOB_TIPO:-}" = "red" ] && [ "${METODO_RED:-cifs}" = "rclone" ]; }
+
+# Carpeta del origen dentro del NAS: recurso/subcarpeta
+nas_raiz_trabajo() { printf '%s' "${RECURSO}${SUBCARPETA:+/${SUBCARPETA}}"; }
+
+nas_usar_trabajo() { nas_usar "$SERVIDOR" "${SMB_PORT:-445}" "$CRED_FILE" "${RCLONE_BIN:-rclone}"; }
 
 # ======================== AYUDAS DE DRIVE =============================
 rc() { timeout "$RCLONE_ESPERA" rclone "$@" </dev/null; }
@@ -847,14 +1072,27 @@ probar_password_db() {   # $1 = usuario  $2 = contrasena
 # de mas reciente a mas antiguo. Se ordena por fecha real y no por nombre,
 # porque el nombre de la carpeta lleva el mes en letras y depende del idioma
 # del servidor que hizo el respaldo.
+#
+# Las carpetas <hora>.subiendo.<trabajo> son envios que el gestor de
+# respaldos todavia no termino de comprobar: NUNCA se ofrecen.
 listar_respaldos_red() {
-  find "$1" -mindepth 2 -maxdepth 2 -type d -printf '%TY-%Tm-%Td %TH:%TM|%P\n' 2>/dev/null | sort -r
+  find "$1" -mindepth 2 -maxdepth 2 -type d ! -name '*.subiendo.*' \
+       -printf '%TY-%Tm-%Td %TH:%TM|%P\n' 2>/dev/null | sort -r
+}
+
+# De la salida de 'rclone lsf --format tp' deja "YYYY-MM-DD HH:MM|<fecha>/<hora>".
+filtrar_lsf() {
+  awk -F'|' '{ r=$2; sub(/\/$/,"",r); n=split(r,a,"/");
+               if (n==2 && r !~ /\.subiendo\./) printf "%s|%s\n", substr($1,1,16), r }' | sort -r
 }
 
 listar_respaldos_drive() {
-  rc lsf "${1}:${2}" --dirs-only -R --max-depth 2 --format "tp" --separator "|" 2>/dev/null \
-    | awk -F'|' '{ r=$2; sub(/\/$/,"",r); n=split(r,a,"/"); if (n==2) printf "%s|%s\n", substr($1,1,16), r }' \
-    | sort -r
+  rc lsf "${1}:${2}" --dirs-only -R --max-depth 2 --format "tp" --separator "|" 2>/dev/null | filtrar_lsf
+}
+
+listar_respaldos_nas() {   # $1 = recurso/subcarpeta  (antes: nas_usar)
+  NAS_ESPERA="$RCLONE_ESPERA" nas_rc lsf "izonenas:${1}" --dirs-only -R --max-depth 2 \
+    --format "tp" --separator "|" 2>/dev/null | filtrar_lsf
 }
 
 asegurar_montaje() {
@@ -874,13 +1112,13 @@ nombre_mes() {
 }
 
 # Muestra los respaldos disponibles. Devuelve 1 si no hay ninguno.
-mostrar_respaldos() {   # $1=tipo  $2=mount|remote  $3=path  $4=cuantos
+mostrar_respaldos() {   # $1=red|drive|rclone  $2=mount|remote|base  $3=path  $4=cuantos
   local tipo="$1" cuantos="${4:-8}" lineas=() i f r
-  if [ "$tipo" = "red" ]; then
-    mapfile -t lineas < <(listar_respaldos_red "$2" | head -n "$cuantos")
-  else
-    mapfile -t lineas < <(listar_respaldos_drive "$2" "$3" | head -n "$cuantos")
-  fi
+  case "$tipo" in
+    red)    mapfile -t lineas < <(listar_respaldos_red "$2" | head -n "$cuantos");;
+    rclone) mapfile -t lineas < <(listar_respaldos_nas "$2" | head -n "$cuantos");;
+    *)      mapfile -t lineas < <(listar_respaldos_drive "$2" "$3" | head -n "$cuantos");;
+  esac
   [ "${#lineas[@]}" -eq 0 ] && return 1
   for i in "${!lineas[@]}"; do
     f="${lineas[$i]%%|*}"; r="${lineas[$i]#*|}"
@@ -890,11 +1128,30 @@ mostrar_respaldos() {   # $1=tipo  $2=mount|remote  $3=path  $4=cuantos
 }
 
 # ================== GENERADOR DEL SCRIPT DE TRABAJO ==================
+# Escribe el script en un archivo nuevo, comprueba su sintaxis y solo
+# entonces lo pone en su lugar, de una sola vez. Si en ese momento hay una
+# restauracion corriendo con el script anterior, sigue leyendo el archivo
+# viejo hasta terminar: sobrescribirlo en el mismo lugar podria cortarla a
+# la mitad, con el sitio en mantenimiento. Si algo falla, el anterior queda.
+instalar_script() {   # instalar_script <archivo .conf> <script>
+  local tmp="${2}.nuevo.$$"
+  generar_script_restauracion "$1" "$tmp" 2>/dev/null && [ -s "$tmp" ] \
+    && bash -n "$tmp" 2>/dev/null && chmod 750 "$tmp" && mv -f "$tmp" "$2" && return 0
+  rm -f "$tmp"
+  return 1
+}
+
 generar_script_restauracion() {
   cat > "$2" <<EOF
 #!/usr/bin/env bash
 # Generado por iZone ENTERPRISE - RESTAURACION
 # La configuracion vive en el .conf; no edite valores aqui.
+#
+# Codigos de salida:
+#   0 correcto   1 no se pudo preparar la restauracion   2 uso incorrecto
+#   4 fallo 'bench restore'   5 restauro, pero fallo 'bench migrate'
+#   6 el respaldo no llego integro (el sitio no se toco)
+#   7 otra restauracion de este trabajo o de este sitio sigue en curso
 CONF="$1"
 EOF
   cat >> "$2" <<'EOF'
@@ -910,9 +1167,48 @@ if [ -n "${DB_CRED_FILE:-}" ] && [ -r "${DB_CRED_FILE:-}" ]; then
 fi
 export RCLONE_CONFIG="${RCLONE_CONFIG:-/root/.config/rclone/rclone.conf}"
 
-log() { echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*"; }
+# Con --listar la salida es la lista misma: los mensajes van a stderr para
+# que nunca se confundan con un respaldo.
+log() {
+  if [ "${SOLO_LISTAR:-0}" = "1" ]; then echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*" >&2
+  else echo "[$(date '+%Y-%m-%d %H:%M:%S')] $*"; fi
+}
 limpiar() { [ -n "${TEMP_LOCAL:-}" ] && rm -rf "${TEMP_LOCAL:?}"/* 2>/dev/null; }
 fallo() { log "[ERROR] $1"; limpiar; exit "${2:-1}"; }
+
+# ---------------------------------------------------------------------
+#  Origen en la Unidad de Red por rclone (sin montaje)
+# ---------------------------------------------------------------------
+RC="${RCLONE_BIN:-rclone}"
+NAS_RAIZ="${RECURSO:-}${SUBCARPETA:+/${SUBCARPETA}}"
+es_rclone() { [ "${JOB_TIPO}" = "red" ] && [ "${METODO_RED:-cifs}" = "rclone" ]; }
+
+# La contrasena vive solo en el .cred. La conexion se arma en variables de
+# entorno de este proceso; no queda escrita en ningun archivo de rclone.
+nas_preparar() {
+  local u p d
+  [ -r "${CRED_FILE:-}" ] || return 1
+  u="$(sed -n 's/^username=//p' "$CRED_FILE" | head -n 1)"
+  p="$(sed -n 's/^password=//p' "$CRED_FILE" | head -n 1)"
+  d="$(sed -n 's/^domain=//p'   "$CRED_FILE" | head -n 1)"
+  [ -n "$u" ] && [ -n "$p" ] || return 1
+  export RCLONE_CONFIG_IZONENAS_TYPE="smb"
+  export RCLONE_CONFIG_IZONENAS_HOST="$SERVIDOR"
+  export RCLONE_CONFIG_IZONENAS_PORT="${SMB_PORT:-445}"
+  export RCLONE_CONFIG_IZONENAS_USER="$u"
+  export RCLONE_CONFIG_IZONENAS_DOMAIN="${d:-WORKGROUP}"
+  RCLONE_CONFIG_IZONENAS_PASS="$(printf '%s' "$p" | "$RC" obscure - 2>/dev/null)"
+  export RCLONE_CONFIG_IZONENAS_PASS
+  [ -n "$RCLONE_CONFIG_IZONENAS_PASS" ]
+}
+
+# De 'rclone lsf --format tp' deja "YYYY-MM-DD HH:MM|<fecha>/<hora>". Las
+# carpetas <hora>.subiendo.<trabajo> son envios que el gestor de respaldos
+# todavia no termino de comprobar: NUNCA se ofrecen ni se restauran.
+filtrar_lsf() {
+  awk -F'|' '{ r=$2; sub(/\/$/,"",r); n=split(r,a,"/");
+               if (n==2 && r !~ /\.subiendo\./) printf "%s|%s\n", substr($1,1,16), r }' | sort -r
+}
 
 MODO="ultimo"; RUTA_PEDIDA=""; FORZAR=0; SOLO_LISTAR=0; SIMULAR=0
 while [ $# -gt 0 ]; do
@@ -976,6 +1272,12 @@ quitar_apps_excluidas() {
 }
 
 montar_origen() {
+  if es_rclone; then
+    "$RC" help backends 2>/dev/null | awk '{print $1}' | grep -qx smb || {
+      log "[ERROR] rclone (${RC}) no esta disponible o no trae soporte SMB."; return 1; }
+    nas_preparar || { log "[ERROR] No se pudieron leer las credenciales ${CRED_FILE:-}"; return 1; }
+    return 0
+  fi
   [ "${JOB_TIPO}" = "red" ] || return 0
   mountpoint -q "$MOUNT_POINT" && return 0
   log "[AVISO] $MOUNT_POINT no esta montado. Intentando montar..."
@@ -984,19 +1286,23 @@ montar_origen() {
 }
 
 listar() {
-  if [ "${JOB_TIPO}" = "red" ]; then
-    find "$MOUNT_POINT" -mindepth 2 -maxdepth 2 -type d \
+  if es_rclone; then
+    "$RC" lsf "izonenas:${NAS_RAIZ}" --dirs-only -R --max-depth 2 \
+      --format "tp" --separator "|" --contimeout 30s --timeout 5m 2>/dev/null | filtrar_lsf
+  elif [ "${JOB_TIPO}" = "red" ]; then
+    find "$MOUNT_POINT" -mindepth 2 -maxdepth 2 -type d ! -name '*.subiendo.*' \
          -printf '%TY-%Tm-%Td %TH:%TM|%P\n' 2>/dev/null | sort -r
   else
     rclone lsf "${RCLONE_REMOTE}:${DEST_PATH}" --dirs-only -R --max-depth 2 \
-      --format "tp" --separator "|" --contimeout 30s --timeout 5m 2>/dev/null \
-      | awk -F'|' '{ r=$2; sub(/\/$/,"",r); n=split(r,a,"/"); if (n==2) printf "%s|%s\n", substr($1,1,16), r }' \
-      | sort -r
+      --format "tp" --separator "|" --contimeout 30s --timeout 5m 2>/dev/null | filtrar_lsf
   fi
 }
 
 tamano_kb_origen() {   # $1 = ruta relativa
-  if [ "${JOB_TIPO}" = "red" ]; then
+  if es_rclone; then
+    "$RC" size "izonenas:${NAS_RAIZ}/${1}" --json --contimeout 30s --timeout 5m 2>/dev/null \
+      | sed -n 's/.*"bytes":[[:space:]]*\([0-9]*\).*/\1/p' | awk '{printf "%d", $1/1024}'
+  elif [ "${JOB_TIPO}" = "red" ]; then
     du -sk "${MOUNT_POINT}/${1}" 2>/dev/null | awk '{print $1}'
   else
     rclone size "${RCLONE_REMOTE}:${DEST_PATH}/${1}" --json --contimeout 30s --timeout 5m 2>/dev/null \
@@ -1011,6 +1317,22 @@ if [ "$SOLO_LISTAR" = "1" ]; then
   exit 0
 fi
 
+# ---------------------- una sola a la vez ----------------------------
+# Dos restauraciones del mismo trabajo se pisarian la carpeta temporal, y
+# dos sobre el mismo sitio -aunque sean de trabajos distintos- lo dejarian
+# inservible. Si la de cron coincide con una manual, la segunda no corre.
+CANDADO_DIR="/run/lock"
+{ [ -d "$CANDADO_DIR" ] && [ -w "$CANDADO_DIR" ]; } || CANDADO_DIR="/tmp"
+exec 8>"${CANDADO_DIR}/izone-restore-${JOB_NOMBRE}.lock" \
+  || { log "[ERROR] No se pudo crear el candado del trabajo."; exit 1; }
+exec 9>"${CANDADO_DIR}/izone-restore-sitio-${SITE//[^A-Za-z0-9._-]/_}.lock" \
+  || { log "[ERROR] No se pudo crear el candado del sitio."; exit 1; }
+if ! flock -n 8 || ! flock -n 9; then
+  log "[AVISO] Otra restauracion de este trabajo, o sobre el sitio ${SITE}, sigue en curso."
+  log "[AVISO] Esta se omite para no cruzarse. No se toco nada."
+  exit 7
+fi
+
 log "=============================================================="
 log "[INICIO] Restauracion '${ETIQUETA}' sobre el sitio ${SITE}"
 
@@ -1021,6 +1343,10 @@ if [ "$MODO" = "ruta" ]; then
   [ -n "$RUTA_PEDIDA" ] || fallo "No se indico la ruta del respaldo."
   RUTA="$RUTA_PEDIDA"
   FECHA_RESPALDO="$(listar | awk -F'|' -v r="$RUTA" '$2==r {print $1; exit}')"
+  # Solo se restaura lo que el listado ofrece: asi una carpeta .subiendo,
+  # o una ruta mal escrita, nunca llega a tocar el sitio.
+  [ -n "$FECHA_RESPALDO" ] || \
+    fallo "El respaldo ${RUTA} no esta en el origen, o el gestor de respaldos todavia lo esta enviando."
 else
   LINEA="$(listar | head -n 1)"
   [ -n "$LINEA" ] || fallo "No se encontro ningun respaldo en el origen."
@@ -1061,7 +1387,12 @@ fi
 # --------------------- traer el respaldo -----------------------------
 mkdir -p "$TEMP_LOCAL" || fallo "No se pudo crear $TEMP_LOCAL"
 rm -rf "${TEMP_LOCAL:?}"/*
-if [ "${JOB_TIPO}" = "red" ]; then
+if es_rclone; then
+  "$RC" copy "izonenas:${NAS_RAIZ}/${RUTA}" "$TEMP_LOCAL" \
+    --contimeout 30s --timeout 30m --retries 3 --low-level-retries 10 \
+    --log-file="${RCLONE_LOG:-/dev/null}" --log-level INFO \
+    || fallo "Fallo la descarga desde //${SERVIDOR}/${NAS_RAIZ}/${RUTA}"
+elif [ "${JOB_TIPO}" = "red" ]; then
   [ -d "${MOUNT_POINT}/${RUTA}" ] || fallo "No existe ${MOUNT_POINT}/${RUTA}"
   cp -a "${MOUNT_POINT}/${RUTA}/." "${TEMP_LOCAL}/" || fallo "No se pudo copiar desde la unidad de red."
 else
@@ -1072,26 +1403,57 @@ else
 fi
 
 # ------------------ verificar lo que llego ---------------------------
+# Todo esto ocurre ANTES de tocar el sitio: si algo falla, el sitio sigue
+# como estaba y ni siquiera entra en mantenimiento.
+
+# 1. Huellas. El gestor de respaldos las calculo sobre el respaldo ya
+#    verificado: si coinciden, lo que llego es identico a ese original,
+#    sin importar por donde haya viajado.
+if [ -f "${TEMP_LOCAL}/SHA256SUMS" ]; then
+  if ! SALIDA_SUMS="$(cd "$TEMP_LOCAL" && sha256sum -c SHA256SUMS 2>&1)"; then
+    printf '%s\n' "$SALIDA_SUMS" | grep -v ': OK$' | head -n 5 \
+      | while IFS= read -r l; do log "        $l"; done
+    fallo "El respaldo ${RUTA} no llego integro: las huellas SHA256 no coinciden. El sitio no se toco." 6
+  fi
+  log "[OK] Huellas SHA256 verificadas: $(grep -c . "${TEMP_LOCAL}/SHA256SUMS") archivo(s) identicos al respaldo original."
+elif [ "${SIN_HUELLAS:-permitir}" = "rechazar" ]; then
+  fallo "El respaldo ${RUTA} no trae SHA256SUMS y este trabajo exige huellas. El sitio no se toco." 6
+else
+  log "[AVISO] El respaldo ${RUTA} no trae SHA256SUMS: se creo antes de la 2.4.0 del gestor de"
+  log "[AVISO] respaldos. Se comprueba su estructura, pero no que sea identico al original."
+fi
+
+# 2. El volcado de la base de datos: que exista, que abra y que llegue
+#    hasta el final. Un volcado cortado a la mitad produce un .gz valido.
 SQL=""; PUB=""; PRIV=""
 for f in "$TEMP_LOCAL"/*database.sql.gz; do [ -f "$f" ] && { SQL="$f"; break; }; done
 if [ -z "$SQL" ]; then
   for f in "$TEMP_LOCAL"/*.sql.gz; do [ -f "$f" ] && { SQL="$f"; break; }; done
 fi
-[ -n "$SQL" ] || fallo "El respaldo ${RUTA} no contiene ningun archivo .sql.gz"
-gzip -t "$SQL" 2>/dev/null || fallo "El archivo de base de datos esta danado: $(basename "$SQL")"
-log "[OK] Base de datos verificada: $(basename "$SQL")"
+[ -n "$SQL" ] || fallo "El respaldo ${RUTA} no contiene ningun archivo .sql.gz. El sitio no se toco." 6
+gzip -t "$SQL" 2>/dev/null || fallo "El archivo de base de datos esta danado: $(basename "$SQL"). El sitio no se toco." 6
+if ! gzip -dc "$SQL" 2>/dev/null | tail -c 4000 \
+     | grep -qE -- "-- Dump completed|UNLOCK TABLES;|^COMMIT;|database dump complete"; then
+  fallo "El volcado $(basename "$SQL") termina a la mitad: no sirve para restaurar. El sitio no se toco." 6
+fi
+log "[OK] Base de datos verificada: $(basename "$SQL") (abre y esta completa)"
 
+# 3. Los adjuntos: que cada tar se pueda leer de punta a punta.
 for f in "$TEMP_LOCAL"/*-files.tar; do
   case "$f" in *private-files.tar) continue;; esac
   [ -f "$f" ] && { PUB="$f"; break; }
 done
 for f in "$TEMP_LOCAL"/*private-files.tar; do [ -f "$f" ] && { PRIV="$f"; break; }; done
-[ -n "$PUB" ]  && log "[INFO] Archivos publicos:  $(basename "$PUB")"
-[ -n "$PRIV" ] && log "[INFO] Archivos privados:  $(basename "$PRIV")"
+for f in "$PUB" "$PRIV"; do
+  [ -n "$f" ] || continue
+  tar -tf "$f" >/dev/null 2>&1 || fallo "Los adjuntos $(basename "$f") estan danados. El sitio no se toco." 6
+done
+[ -n "$PUB" ]  && log "[OK] Archivos publicos verificados:  $(basename "$PUB")"
+[ -n "$PRIV" ] && log "[OK] Archivos privados verificados:  $(basename "$PRIV")"
 [ -z "$PUB" ] && [ -z "$PRIV" ] && log "[AVISO] El respaldo no trae adjuntos; solo se restaura la base de datos."
 
 if [ "$SIMULAR" = "1" ]; then
-  log "[INFO] Simulacion: el respaldo es valido y se pudo traer completo."
+  log "[INFO] Simulacion: el respaldo llego completo e integro."
   log "[INFO] No se toco el sitio ${SITE}."
   limpiar
   log "[FIN] Simulacion terminada en $(( $(date +%s) - INICIO_SEG )) segundos."
@@ -1221,6 +1583,8 @@ crear_trabajo() {
   local PREVIO="no" PREVIO_DIR="" PREVIO_CONSERVAR="3"
   local MIGRAR="si" SCHEDULER="no-tocar" MUTE_EMAILS="no" EXCLUIR_APPS=""
   local AUTOMATICO="no" HORARIOS="" DIAS_CRON="*"
+  local METODO_RED="" METODO_ENTORNO="" ENTORNO_DESC="" ENTORNO_MOTIVO="" RCLONE_BIN=""
+  local SIN_HUELLAS="permitir"
   local paso=1 estado NAV_ON=1 volver_resumen=0
 
   while :; do
@@ -1256,15 +1620,26 @@ rst_cancelar() {
 
 # --------------------------- [1] Etiqueta ----------------------------
 rst_paso_etiqueta() {
-  local titulo="Unidad de Red (CIFS)"
+  local titulo="Unidad de Red"
   [ "$TIPO" = "drive" ] && titulo="Google Drive"
   pantalla "NUEVO TRABAJO  >  ${titulo}   [1 de 5]"
   if [ "$TIPO" = "red" ]; then
-    if ! command -v mount.cifs >/dev/null 2>&1; then
-      info "Verificando dependencias..."
-      asegurar_paquete cifs-utils mount.cifs || {
-        err "Sin cifs-utils el servidor no puede montar carpetas de red."
-        enter; return 3; }
+    # El entorno decide el camino. Montar por CIFS es el primero; si este
+    # servidor no puede montar, ni se intenta: se lee el NAS con rclone.
+    if entorno_puede_montar; then
+      METODO_RED="cifs"; METODO_ENTORNO="cifs"
+      if ! command -v mount.cifs >/dev/null 2>&1; then
+        info "Verificando dependencias..."
+        asegurar_paquete cifs-utils mount.cifs || {
+          err "Sin cifs-utils el servidor no puede montar carpetas de red."
+          enter; return 3; }
+        echo
+      fi
+    else
+      METODO_RED="rclone"; METODO_ENTORNO="rclone"
+      info "Entorno detectado: ${C_B}${ENTORNO_DESC}${C_R}"
+      say "  ${C_DIM}Aqui el sistema no permite montar carpetas de red. Los respaldos se${C_R}"
+      say "  ${C_DIM}leeran del NAS con rclone, sin montar nada.${C_R}"
       echo
     fi
   else
@@ -1297,7 +1672,23 @@ rst_paso_origen() {
 verificar_origen() {
   local r
   pantalla "TRABAJO '${ETIQUETA}'  >  [2 de 5] Respaldos encontrados"
-  if [ "$TIPO" = "red" ]; then
+  if [ "$TIPO" = "red" ] && [ "$METODO_RED" = "rclone" ]; then
+    say "  Origen: ${C_B}${UNC}${C_R}  por rclone, sin montaje"
+    echo
+    info "Leyendo el contenido del NAS..."
+    echo
+    nas_usar "$SRV" "$SMB_PORT" "$CRED_FILE" "$RCLONE_BIN"
+    if mostrar_respaldos rclone "${SHARE}${SUB:+/$SUB}" "" 8; then
+      echo; ok "Se encontraron respaldos con la estructura <fecha>/<hora>."
+    else
+      err "No se encontraron carpetas con la estructura <fecha>/<hora>."
+      say "    ${C_DIM}El origen debe apuntar a la carpeta que contiene las fechas, no${C_R}"
+      say "    ${C_DIM}a una fecha concreta. Con 'v' vuelve a corregirlo.${C_R}"
+      echo
+      si_no_nav "Continuar de todos modos?"; r=$?
+      case "$r" in 0) ;; 1) return 2;; *) return "$r";; esac
+    fi
+  elif [ "$TIPO" = "red" ]; then
     say "  Origen: ${C_B}${UNC}${C_R}  en ${MOUNT_POINT}"
     echo
     if ! asegurar_montaje "$MOUNT_POINT"; then
@@ -1341,12 +1732,19 @@ heredar_red() {   # $1 = .conf del gestor de respaldos
   local d=()
   mapfile -t d < <( . "$1" >/dev/null 2>&1
       printf '%s\n' "${SERVIDOR:-}" "${SMB_PORT:-445}" "${RECURSO:-}" "${SUBCARPETA:-}" \
-                    "${UNC:-}" "${MOUNT_POINT:-}" "${CRED_FILE:-}" "${SMB_VERS:-3.0}" )
+                    "${UNC:-}" "${MOUNT_POINT:-}" "${CRED_FILE:-}" "${SMB_VERS:-3.0}" \
+                    "${METODO_RED:-cifs}" "${RCLONE_BIN:-}" )
   SRV="${d[0]}"; SMB_PORT="${d[1]}"; SHARE="${d[2]}"; SUB="${d[3]}"
   UNC="${d[4]}"; MOUNT_POINT="${d[5]}"; CRED_FILE="${d[6]}"; SMB_VERS="${d[7]}"
   MOUNT_OPTS=""
   MONTAJE_PROPIO="no"
   ORIGEN_CONF="$1"
+  # Si el respaldo va por rclone, o este servidor no puede montar, el
+  # origen se lee por rclone con el mismo servidor, recurso y credenciales.
+  if [ "${d[8]}" = "rclone" ] || [ "$METODO_ENTORNO" = "rclone" ]; then
+    METODO_RED="rclone"; RCLONE_BIN="${d[9]}"
+    MOUNT_POINT=""; SMB_VERS=""
+  fi
 }
 
 heredar_drive() {
@@ -1359,6 +1757,8 @@ heredar_drive() {
 
 rst_origen_red() {
   local confs=() i op res
+  # Cada vez que se entra aqui se parte de lo que permite el entorno.
+  METODO_RED="${METODO_ENTORNO:-cifs}"; RCLONE_BIN=""
   pantalla "TRABAJO '${ETIQUETA}'  >  [2 de 5] Origen de los respaldos"
   aviso_navegacion
   mapfile -t confs < <(listar_confs_respaldo red)
@@ -1380,6 +1780,11 @@ rst_origen_red() {
       if [[ "$op" =~ ^[0-9]+$ ]] && [ "$op" -ge 1 ] && [ "$op" -le "${#confs[@]}" ]; then
         heredar_red "${confs[$((op-1))]}"
         echo; ok "Origen: ${UNC}"
+        if [ "$METODO_RED" = "rclone" ]; then
+          say "    ${C_DIM}lectura por rclone, sin montaje   heredado de $(basename "$ORIGEN_CONF")${C_R}"
+          echo
+          rst_conexion_rclone; return $?
+        fi
         say "    ${C_DIM}montaje: ${MOUNT_POINT}   heredado de $(basename "$ORIGEN_CONF")${C_R}"
         sleep 2; return 0
       elif [ "$op" = "0" ]; then break
@@ -1583,6 +1988,9 @@ orn_montaje() {
   aviso_navegacion
   say "  Recurso: ${C_B}${UNC}${C_R}"
   echo
+  if [ "$METODO_RED" = "rclone" ]; then
+    rst_conexion_rclone; return $?
+  fi
   info "Probando versiones del protocolo SMB..."
   SMB_VERS="$(probar_version_smb "$UNC" "$CRED_FILE" "$SMB_PORT")"
   if [ -n "$SMB_VERS" ]; then
@@ -1593,6 +2001,17 @@ orn_montaje() {
     salida="$(mount -t cifs "$UNC" "$d" -o "ro,credentials=${CRED_FILE},vers=3.0,sec=ntlmssp,iocharset=utf8,nounix,noserverino$([ "$SMB_PORT" != "445" ] && echo ",port=${SMB_PORT}")" 2>&1)"
     rmdir "$d" 2>/dev/null
     echo; explicar_error_mount "$salida"; echo
+    case "$salida" in
+      *"error(1)"*)
+        # Usuario, contrasena y ruta pueden estar bien: es el sistema el que
+        # no deja montar. Se pasa al segundo camino, que no necesita montar,
+        # y su propia prueba confirma si de verdad funciona.
+        METODO_RED="rclone"
+        ENTORNO_MOTIVO="el sistema rechazo el montaje (mount error 1)"
+        info "Se usara el segundo camino: rclone, sin montaje."
+        echo
+        rst_conexion_rclone; return $?;;
+    esac
     si_no_nav "Guardar la configuracion de todas formas?"; r=$?
     case "$r" in
       1) return 2;;
@@ -1617,6 +2036,42 @@ orn_montaje() {
     warn "Se guardo la configuracion; corrijala desde el trabajo."
   fi
   enter
+  return 0
+}
+
+# Segundo camino: el NAS se lee con rclone, sin montar nada. El trabajo
+# no se crea hasta que la prueba de lectura salga bien.
+rst_conexion_rclone() {
+  local op
+  say "  ${C_B}Camino: rclone, sin montaje${C_R}"
+  [ -n "$ENTORNO_MOTIVO" ] && say "  ${C_DIM}Motivo: ${ENTORNO_MOTIVO}.${C_R}"
+  echo
+  if rclone_con_smb "${RCLONE_BIN:-}"; then
+    ok "rclone $(rclone_version_de "$RCLONE_BIN") con soporte SMB: ${RCLONE_BIN}"
+  else
+    red_asegurar_rclone || return $?
+  fi
+  echo
+  nas_usar "$SRV" "$SMB_PORT" "$CRED_FILE" "$RCLONE_BIN"
+  while ! nas_probar_lectura "${SHARE}${SUB:+/$SUB}"; do
+    echo
+    say "  ${C_DIM}El trabajo no se crea hasta que esta prueba salga bien.${C_R}"
+    say "   r) Reintentar la prueba"
+    say "   v) Volver para corregir la ruta o las credenciales"
+    say "   x) Cancelar"
+    while true; do
+      read -rp "  Opcion [r]: " op || fin_entrada
+      case "${op,,}" in
+        ""|r) break;;
+        v) return 2;;
+        x) return 3;;
+        *) err "Opcion invalida.";;
+      esac
+    done
+    echo
+  done
+  SMB_VERS=""; MOUNT_POINT=""; MOUNT_OPTS=""
+  sleep 1
   return 0
 }
 
@@ -1753,7 +2208,8 @@ rst_paso_programacion() {
 # ---------------------- [5] Revision final ---------------------------
 rst_paso_resumen() {
   local op origen
-  if [ "$TIPO" = "red" ]; then origen="${UNC}  (${MOUNT_POINT})"
+  if [ "$TIPO" = "red" ] && [ "$METODO_RED" = "rclone" ]; then origen="${UNC}  (rclone, sin montaje)"
+  elif [ "$TIPO" = "red" ]; then origen="${UNC}  (${MOUNT_POINT})"
   else origen="${RCLONE_REMOTE}:${DEST_PATH}"; fi
   while true; do
     pantalla "TRABAJO '${ETIQUETA}'  >  [5 de 5] Revision final"
@@ -1810,9 +2266,17 @@ rst_paso_resumen() {
     "MIGRAR=${MIGRAR}" "SCHEDULER=${SCHEDULER}" "MUTE_EMAILS=${MUTE_EMAILS}" \
     "EXCLUIR_APPS=${EXCLUIR_APPS}" \
     "AUTOMATICO=${AUTOMATICO}" "HORARIOS=${HORARIOS}" "DIAS_CRON=${DIAS_CRON}" \
-    "LOG_FILE=${LOG_FILE}" "RCLONE_LOG=${RCLONE_LOG}" "STATE_FILE=${STATE_FILE}"
+    "METODO_RED=${METODO_RED}" "ENTORNO=${ENTORNO_DESC}" "RCLONE_BIN=${RCLONE_BIN}" \
+    "SIN_HUELLAS=${SIN_HUELLAS}" \
+    "LOG_FILE=${LOG_FILE}" "RCLONE_LOG=${RCLONE_LOG}" "STATE_FILE=${STATE_FILE}" \
+    "GEN_VERSION=${GEN_VERSION_ACTUAL}"
 
-  generar_script_restauracion "$CONF" "$SCRIPT"
+  if ! instalar_script "$CONF" "$SCRIPT"; then
+    pantalla "TRABAJO '${ETIQUETA}'  >  Resultado"
+    err "No se pudo generar el script ${SCRIPT}. No se programo nada."
+    say "    ${C_DIM}La configuracion quedo en ${CONF}.${C_R}"
+    enter; return 9
+  fi
   touch "$LOG_FILE" "$RCLONE_LOG"; chmod 640 "$LOG_FILE" "$RCLONE_LOG"
   reprogramar "$CONF"
 
@@ -2049,9 +2513,47 @@ menu_horarios() {
 }
 
 editar_origen() {
-  local conf="$1" op nuevo nmp nvers nopts sal nrem
+  local conf="$1" op nuevo nmp nvers nopts sal nrem nsrv nrec nsub
   cargar_conf "$conf"
-  if [ "$JOB_TIPO" = "red" ]; then
+  if es_red_rclone; then
+    pantalla "TRABAJO '${ETIQUETA}'  >  Origen de red (rclone)"
+    say "  Actual : ${C_B}${UNC}${C_R}   lectura por rclone, sin montaje"
+    [ -n "${ORIGEN_CONF:-}" ] && say "  ${C_DIM}Heredado de $(basename "$ORIGEN_CONF")${C_R}"
+    echo
+    say "   1) Probar la lectura del NAS"
+    say "   2) Cambiar la cadena de conexion"
+    say "   0) Volver"
+    echo
+    read -rp "  Opcion: " op || fin_entrada
+    case "$op" in
+      1) echo
+         if rclone_con_smb "${RCLONE_BIN:-}"; then
+           nas_usar_trabajo; nas_probar_lectura "$(nas_raiz_trabajo)"
+         else
+           err "No se encuentra un rclone con SMB en ${RCLONE_BIN:-(sin definir)}."
+         fi;;
+      2) while true; do
+           pedir nuevo "Nueva cadena de conexion"
+           nuevo="${nuevo//\\//}"; nuevo="${nuevo%/}"
+           [[ "$nuevo" =~ ^//[^/]+/.+ ]] && break
+           err "Formato invalido. Debe iniciar con // seguido del servidor y el recurso."
+         done
+         nsrv="${nuevo#//}"; nrec="${nsrv#*/}"; nsrv="${nsrv%%/*}"
+         nsub=""; [[ "$nrec" == */* ]] && nsub="${nrec#*/}"
+         nrec="${nrec%%/*}"
+         nas_usar "$nsrv" "${SMB_PORT:-445}" "$CRED_FILE" "${RCLONE_BIN:-rclone}"
+         echo
+         if nas_probar_lectura "${nrec}${nsub:+/$nsub}"; then
+           set_conf "$conf" UNC "$nuevo"; set_conf "$conf" SERVIDOR "$nsrv"
+           set_conf "$conf" RECURSO "$nrec"; set_conf "$conf" SUBCARPETA "$nsub"
+           set_conf "$conf" ORIGEN_CONF ""
+           ok "Origen actualizado: ${nuevo}"
+         else
+           err "La prueba de lectura fallo. El origen NO se cambio."
+         fi;;
+      0) return 0;;
+    esac
+  elif [ "$JOB_TIPO" = "red" ]; then
     pantalla "TRABAJO '${ETIQUETA}'  >  Origen de red"
     say "  Actual : ${C_B}${UNC}${C_R}"
     say "  Montaje: ${MOUNT_POINT}"
@@ -2150,6 +2652,7 @@ menu_opciones() {
     if [ "$JOB_TIPO" = "red" ] && [ "${MONTAJE_PROPIO:-no}" = "si" ]; then
     say "   9) Credenciales del recurso de red"
     fi
+    say "   h) Respaldos sin SHA256SUMS: $([ "${SIN_HUELLAS:-permitir}" = rechazar ] && echo "se rechazan" || echo "se aceptan con aviso")"
     say "   0) Volver"
     echo
     read -rp "  Opcion: " op || fin_entrada
@@ -2238,10 +2741,27 @@ menu_opciones() {
          pedir d "Dominio o grupo de trabajo" "WORKGROUP"
          { echo "username=${u}"; echo "password=${p}"; echo "domain=${d}"; } > "$CRED_FILE"
          chmod 600 "$CRED_FILE"; ok "Credenciales actualizadas."
-         umount "$MOUNT_POINT" >/dev/null 2>&1
-         sal="$(mount "$MOUNT_POINT" 2>&1)"
-         mountpoint -q "$MOUNT_POINT" && ok "Montaje validado." || explicar_error_mount "$sal"
+         if es_red_rclone; then
+           echo; nas_usar_trabajo; nas_probar_lectura "$(nas_raiz_trabajo)"
+         else
+           umount "$MOUNT_POINT" >/dev/null 2>&1
+           sal="$(mount "$MOUNT_POINT" 2>&1)"
+           mountpoint -q "$MOUNT_POINT" && ok "Montaje validado." || explicar_error_mount "$sal"
+         fi
          enter;;
+      h|H) pantalla "TRABAJO '${ETIQUETA}'  >  Respaldos sin SHA256SUMS"
+         say "  Los respaldos hechos con el gestor de respaldos 2.4.0 o posterior traen"
+         say "  un SHA256SUMS: con el se comprueba que lo que llega es identico al"
+         say "  original. Los anteriores no lo traen, y de ellos solo se puede"
+         say "  comprobar la estructura: que el volcado abra y este completo, y que"
+         say "  los adjuntos se puedan leer."
+         echo
+         if si_no "Aceptar los respaldos sin SHA256SUMS (con aviso en el log)?"; then
+           set_conf "$conf" SIN_HUELLAS "permitir"
+         else
+           set_conf "$conf" SIN_HUELLAS "rechazar"
+         fi
+         ok "Actualizado."; sleep 1;;
       0) return 0;;
       *) err "Opcion invalida."; sleep 1;;
     esac
@@ -2257,7 +2777,11 @@ eliminar_trabajo() {
   si_no "Confirma eliminar el trabajo '${JOB_NOMBRE}'?" || { enter; return 1; }
   cron_aplicar "$JOB_NOMBRE" ""
   rm -f "${BIN_DIR}/${JOB_NOMBRE}.sh" "$STATE_FILE" "$DB_CRED_FILE"
-  if [ "$JOB_TIPO" = "red" ] && [ "${MONTAJE_PROPIO:-no}" = "si" ]; then
+  if es_red_rclone; then
+    # Sin montaje no hay nada en /etc/fstab. Las credenciales se borran solo
+    # si son de este trabajo, no si se heredaron del gestor de respaldos.
+    [ "${MONTAJE_PROPIO:-no}" = "si" ] && rm -f "$CRED_FILE"
+  elif [ "$JOB_TIPO" = "red" ] && [ "${MONTAJE_PROPIO:-no}" = "si" ]; then
     if si_no "Desmontar y quitar la linea de /etc/fstab?"; then
       umount "$MOUNT_POINT" >/dev/null 2>&1
       fstab_quitar "$JOB_NOMBRE" "$MOUNT_POINT"
@@ -2280,8 +2804,11 @@ menu_trabajo() {
   while true; do
     [ -f "$conf" ] || return 0
     cargar_conf "$conf"
-    pantalla "TRABAJO: ${ETIQUETA}  [${JOB_TIPO}]"
-    if [ "$JOB_TIPO" = "red" ]; then
+    pantalla "TRABAJO: ${ETIQUETA}  [${JOB_TIPO}$(es_red_rclone && echo ' · rclone')]"
+    if es_red_rclone; then
+      say "  Origen  : ${UNC}"
+      say "  Lectura : rclone, sin montaje  ${C_DIM}(${ENTORNO:-entorno sin registrar})${C_R}"
+    elif [ "$JOB_TIPO" = "red" ]; then
       say "  Origen  : ${UNC}"
       mountpoint -q "$MOUNT_POINT" \
         && say "  Montaje : ${C_GR}activo${C_R} en ${MOUNT_POINT} ${C_DIM}(solo lectura)${C_R}" \
@@ -2344,8 +2871,10 @@ menu_trabajos() {
     else
       for i in "${!confs[@]}"; do
         ( cargar_conf "${confs[$i]}"
-          local origen estado prog
-          if [ "$JOB_TIPO" = "red" ]; then
+          local origen estado prog tipo="$JOB_TIPO"
+          if es_red_rclone; then
+            origen="$UNC"; tipo="red · rclone"; estado="${C_DIM}sin montaje${C_R}"
+          elif [ "$JOB_TIPO" = "red" ]; then
             origen="$UNC"
             mountpoint -q "$MOUNT_POINT" && estado="${C_GR}montado${C_R}" || estado="${C_RD}sin montar${C_R}"
           else
@@ -2356,7 +2885,7 @@ menu_trabajos() {
           else
             prog="solo manual"
           fi
-          printf '%b\n' "   ${C_B}$((i+1))) ${ETIQUETA}${C_R}  ${C_DIM}[${JOB_TIPO}]${C_R}  ${estado}"
+          printf '%b\n' "   ${C_B}$((i+1))) ${ETIQUETA}${C_R}  ${C_DIM}[${tipo}]${C_R}  ${estado}"
           printf '%b\n' "       ${C_DIM}origen : ${origen}${C_R}"
           printf '%b\n' "       ${C_DIM}destino: sitio ${SITE}${C_R}"
           printf '%b\n' "       ${C_DIM}horario: ${prog}${C_R}"
@@ -2364,7 +2893,7 @@ menu_trabajos() {
       done
     fi
     echo
-    say "   ${C_B}r${C_R}) Nuevo trabajo desde una Unidad de Red (CIFS)"
+    say "   ${C_B}r${C_R}) Nuevo trabajo desde una Unidad de Red (NAS)"
     say "   ${C_B}g${C_R}) Nuevo trabajo desde Google Drive"
     say "   ${C_B}0${C_R}) Volver"
     echo
@@ -2390,11 +2919,33 @@ diagnostico() {
   for i in "${!confs[@]}"; do
     pantalla "DIAGNOSTICO  ($((i+1)) de ${#confs[@]})"
     ( cargar_conf "${confs[$i]}"
-      local n scr ult
-      say "  ${C_B}${C_CY}== ${ETIQUETA}  [${JOB_TIPO}] ==${C_R}"
+      local n scr ult base
+      say "  ${C_B}${C_CY}== ${ETIQUETA}  [${JOB_TIPO}$(es_red_rclone && echo ' · rclone')] ==${C_R}"
       echo
       say "  ${C_B}Origen${C_R}"
-      if [ "$JOB_TIPO" = "red" ]; then
+      if es_red_rclone; then
+        base="$(nas_raiz_trabajo)"
+        say "  ${C_DIM}recurso: ${UNC}   lectura por rclone, sin montaje${C_R}"
+        say "  ${C_DIM}entorno al crear el trabajo: ${ENTORNO:-sin registrar}${C_R}"
+        if rclone_con_smb "${RCLONE_BIN:-}"; then
+          ok "rclone: ${RCLONE_BIN} ($(rclone_version_de "$RCLONE_BIN"))"
+        else
+          err "no se encuentra un rclone con SMB en ${RCLONE_BIN:-(sin definir)}"
+        fi
+        [ -f "$CRED_FILE" ] && ok "credenciales del recurso: permisos $(stat -c '%a' "$CRED_FILE")" \
+                            || err "faltan las credenciales del recurso: $CRED_FILE"
+        nas_usar_trabajo
+        n="$(listar_respaldos_nas "$base" | wc -l)"
+        if [ "$n" -gt 0 ]; then
+          ok "respaldos visibles: ${n}"
+          say "  ${C_DIM}mas recientes:${C_R}"
+          listar_respaldos_nas "$base" | head -n 3 | sed 's/|/   /' | sed 's/^/    /'
+        else err "no se ve ningun respaldo con estructura <fecha>/<hora> en //${SERVIDOR}/${base}"; fi
+        if [ -n "${ORIGEN_CONF:-}" ]; then
+          [ -f "$ORIGEN_CONF" ] && ok "el trabajo de respaldo de origen sigue existiendo" \
+                                || warn "el trabajo de respaldo de origen ya no existe"
+        fi
+      elif [ "$JOB_TIPO" = "red" ]; then
         say "  ${C_DIM}recurso: ${UNC}${C_R}"
         if mountpoint -q "$MOUNT_POINT"; then
           ok "montado en $MOUNT_POINT"
@@ -2458,6 +3009,10 @@ diagnostico() {
       fi
       [ "${PREVIO:-no}" = "si" ] && ok "respaldo previo activo; conserva ${PREVIO_CONSERVAR}" \
                                  || say "  ${C_DIM}sin respaldo previo${C_R}"
+      [ "${SIN_HUELLAS:-permitir}" = "rechazar" ] && ok "exige SHA256SUMS en cada respaldo" \
+        || say "  ${C_DIM}acepta respaldos sin SHA256SUMS, con aviso${C_R}"
+      [ "${GEN_VERSION:-}" = "$GEN_VERSION_ACTUAL" ] && ok "script del trabajo en la version ${GEN_VERSION}" \
+        || warn "el script del trabajo no esta en la version ${GEN_VERSION_ACTUAL}"
       ult="$(cat "$STATE_FILE" 2>/dev/null)"
       [ -n "$ult" ] && ok "ultimo respaldo restaurado: ${ult}" || warn "todavia no se ha restaurado nada"
       if [ -f "$LOG_FILE" ] && [ -s "$LOG_FILE" ]; then
@@ -2466,6 +3021,52 @@ diagnostico() {
       fi )
     enter
   done
+}
+
+# ===================== MIGRACION DE TRABAJOS =========================
+# Actualizar el gestor NO actualiza los scripts ya generados: siguen en
+# disco tal como se escribieron. Sin esto, un trabajo creado con una
+# version anterior seguiria restaurando sin comprobar las huellas.
+migrar_trabajos() {
+  local c job n=0 fallos=0
+  while IFS= read -r c; do
+    [ -n "$c" ] || continue
+    grep -q "^GEN_VERSION=\"${GEN_VERSION_ACTUAL}\"" "$c" 2>/dev/null && continue
+    grep -q '^SIN_HUELLAS=' "$c" 2>/dev/null || set_conf "$c" SIN_HUELLAS "permitir"
+    if grep -q '^JOB_TIPO="red"' "$c" 2>/dev/null && ! grep -q '^METODO_RED=' "$c" 2>/dev/null; then
+      set_conf "$c" METODO_RED "cifs"
+    fi
+    job="$(sed -n 's/^JOB_NOMBRE="\(.*\)"$/\1/p' "$c" | tail -n 1)"
+    if [ -n "$job" ]; then
+      if ! instalar_script "$c" "${BIN_DIR}/${job}.sh"; then
+        fallos=$((fallos+1)); continue   # el script anterior sigue intacto
+      fi
+      n=$((n+1))
+    fi
+    set_conf "$c" GEN_VERSION "$GEN_VERSION_ACTUAL"
+  done < <(listar_confs)
+
+  if [ "$fallos" -gt 0 ]; then
+    pantalla "ACTUALIZACION DE TRABAJOS"
+    err "No se pudo actualizar el script de ${fallos} trabajo(s)."
+    say "  ${C_DIM}Siguen funcionando con su script anterior, que no se toco.${C_R}"
+    enter
+  fi
+  [ "$n" -eq 0 ] && return 0
+  pantalla "ACTUALIZACION DE TRABAJOS"
+  ok "Se actualizaron ${n} trabajo(s) a la version ${GEN_VERSION_ACTUAL}."
+  echo
+  say "  Antes de tocar el sitio, cada restauracion comprueba ahora que el"
+  say "  respaldo llego integro: sus huellas SHA256, que el volcado este completo"
+  say "  y que los adjuntos se puedan leer. Si algo falla, el sitio no se toca."
+  say "  Los respaldos que el gestor de respaldos todavia esta enviando nunca"
+  say "  se ofrecen."
+  echo
+  say "  ${C_DIM}Los origenes, sitios, horarios y opciones no cambiaron. Los respaldos${C_R}"
+  say "  ${C_DIM}sin SHA256SUMS se siguen aceptando con aviso; se puede exigir desde${C_R}"
+  say "  ${C_DIM}las opciones de cada trabajo.${C_R}"
+  enter
+  return 0
 }
 
 # ========================= MENU PRINCIPAL ============================
@@ -2498,4 +3099,5 @@ menu_principal() {
 
 requiere_root
 mkdir -p "$APP_DIR" "$LOG_DIR" "$PREVIO_BASE"; chmod 750 "$APP_DIR" "$PREVIO_BASE"
+migrar_trabajos
 menu_principal
